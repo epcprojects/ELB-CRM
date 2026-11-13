@@ -1,0 +1,865 @@
+'use client';
+
+import { useCallback, useEffect, useRef, useState } from 'react';
+import type { Socket } from 'socket.io-client';
+import { getSocket } from '../../lib/socket';
+
+export type ChatChannel = 'internal' | 'external';
+
+export type ChatMessageReactionActor = {
+  id?: string | null;
+  fullName?: string | null;
+};
+
+export type ChatMessageReaction = {
+  emoji: string;
+  count: number;
+  actors?: ChatMessageReactionActor[] | null;
+  reactedByCurrentUser?: boolean | null;
+  isCurrentUser?: boolean | null;
+  userReacted?: boolean | null;
+};
+
+export type ChatMessage = {
+  id: string;
+  projectId: string;
+  ticketId: string;
+  senderId: string;
+  mentionedUserIds?: string[] | null;
+  messageType: 'text' | 'attachment';
+  message: string;
+  attachmentUrl?: string | null;
+  attachmentUrls?: string[] | null;
+  attachmentName?: string | null;
+  attachmentSize?: number | null;
+  isRead?: boolean;
+  readAt?: string | null;
+  createdAt: string;
+  updatedAt?: string;
+  reactions?: ChatMessageReaction[] | null;
+  sender?: {
+    id: string;
+    name?: string;
+    fullName?: string;
+    avatarUrl?: string;
+  } | null;
+  receiver?: {
+    id: string;
+    name?: string;
+    fullName?: string;
+    avatarUrl?: string;
+  } | null;
+};
+
+type SendChatMessagePayload = {
+  message: string;
+  messageType?: 'text' | 'attachment';
+  attachmentUrl?: string;
+  attachmentUrls?: string[];
+  attachmentName?: string;
+  attachmentSize?: number;
+  mentionedUserIds?: string[];
+};
+
+type ChatMessagesCursor = {
+  createdAt: string;
+  id: string;
+};
+
+type ChatMessagesPage = {
+  messages: ChatMessage[];
+  cursor: ChatMessagesCursor | null;
+  hasMore: boolean;
+  message?: string;
+};
+
+type ChatMessagesResponse = {
+  messages?: ChatMessage[];
+  cursor?: {
+    createdAt?: string | null;
+    id?: string | null;
+  } | null;
+  hasMore?: boolean | null;
+  message?: string;
+};
+
+function isChatMessage(value: unknown): value is ChatMessage {
+  return Boolean(
+    value &&
+      typeof value === 'object' &&
+      'id' in value &&
+      'projectId' in value &&
+      'ticketId' in value &&
+      'senderId' in value &&
+      'message' in value,
+  );
+}
+
+type UseTicketChatOptions = {
+  projectId: string;
+  ticketId: string;
+  channel: ChatChannel;
+  enabled?: boolean;
+};
+
+type TypingUser = {
+  userId: string;
+  name: string;
+};
+
+type SocketTokenResponse = {
+  accessToken: string;
+  socketUrl: string;
+};
+
+async function fetchSocketToken(): Promise<SocketTokenResponse> {
+  const response = await fetch('/api/auth/socket-token', {
+    method: 'GET',
+    headers: {
+      Accept: 'application/json',
+    },
+    cache: 'no-store',
+    credentials: 'include',
+  });
+
+  const payload = (await response.json().catch(() => null)) as
+    | SocketTokenResponse
+    | { message?: string }
+    | null;
+
+  if (!response.ok || !payload || !('accessToken' in payload)) {
+    throw new Error(
+      payload && 'message' in payload
+        ? payload.message || 'Failed to authorize socket connection.'
+        : 'Failed to authorize socket connection.',
+    );
+  }
+
+  return payload;
+}
+
+async function fetchMessages(
+  projectId: string,
+  ticketId: string,
+  channel: ChatChannel,
+  cursor: ChatMessagesCursor | null,
+): Promise<ChatMessagesPage> {
+  const searchParams = new URLSearchParams({
+    limit: '30',
+  });
+
+  if (cursor?.createdAt) {
+    searchParams.set('cursorCreatedAt', cursor.createdAt);
+  }
+
+  if (cursor?.id) {
+    searchParams.set('cursorId', cursor.id);
+  }
+
+  const response = await fetch(
+    `/api/projects/${projectId}/tickets/${ticketId}/chat/${channel}/messages?${searchParams.toString()}`,
+    {
+      method: 'GET',
+      headers: {
+        Accept: 'application/json',
+      },
+      cache: 'no-store',
+    },
+  );
+
+  const payload = (await response.json().catch(() => null)) as
+    | ChatMessagesResponse
+    | ChatMessage[]
+    | { message?: string }
+    | null;
+
+  const normalizedPayload = normalizeChatMessagesResponse(payload);
+
+  if (!response.ok || !normalizedPayload) {
+    throw new Error(
+      normalizedPayload?.message || 'Failed to fetch chat messages.',
+    );
+  }
+
+  return normalizedPayload;
+}
+
+function normalizeChatMessagesResponse(
+  payload: ChatMessagesResponse | ChatMessage[] | { message?: string } | null,
+): ChatMessagesPage | null {
+  if (Array.isArray(payload)) {
+    return {
+      messages: payload,
+      cursor: null,
+      hasMore: false,
+    };
+  }
+
+  if (!isChatMessagesResponse(payload)) {
+    return payload && 'message' in payload
+      ? {
+          message: payload.message || 'Failed to fetch chat messages.',
+          messages: [],
+          cursor: null,
+          hasMore: false,
+        }
+      : null;
+  }
+
+  return {
+    messages: payload.messages,
+    cursor:
+      payload.cursor?.id && payload.cursor?.createdAt
+        ? {
+            id: payload.cursor.id,
+            createdAt: payload.cursor.createdAt,
+          }
+        : null,
+    hasMore: Boolean(payload.hasMore),
+  };
+}
+
+function isChatMessagesResponse(
+  payload: ChatMessagesResponse | ChatMessage[] | { message?: string } | null,
+): payload is ChatMessagesResponse & { messages: ChatMessage[] } {
+  return Boolean(
+    payload &&
+      typeof payload === 'object' &&
+      !Array.isArray(payload) &&
+      Array.isArray((payload as ChatMessagesResponse).messages),
+  );
+}
+
+function normalizeIncomingMessages(messages: ChatMessage[]) {
+  const messagesById = new Map<string, ChatMessage>();
+
+  messages
+    .slice()
+    .reverse()
+    .forEach((message) => {
+      messagesById.set(message.id, message);
+    });
+
+  return Array.from(messagesById.values());
+}
+
+export function useTicketChat({
+  projectId,
+  ticketId,
+  channel,
+  enabled = true,
+}: UseTicketChatOptions) {
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [connected, setConnected] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [typingUsers, setTypingUsers] = useState<TypingUser[]>([]);
+  const [cursor, setCursor] = useState<ChatMessagesCursor | null>(null);
+  const [hasMore, setHasMore] = useState(false);
+  const socketRef = useRef<Socket | null>(null);
+
+  useEffect(() => {
+    if (!enabled || !projectId || !ticketId) {
+      setMessages([]);
+      setTypingUsers([]);
+      setConnected(false);
+      setLoading(false);
+      return;
+    }
+
+    let isDisposed = false;
+
+    const load = async (): Promise<(() => void) | undefined> => {
+      setLoading(true);
+
+      try {
+        const [initialPage, socketToken] = await Promise.all([
+          fetchMessages(projectId, ticketId, channel, null),
+          fetchSocketToken(),
+        ]);
+
+        if (isDisposed) {
+          return;
+        }
+
+        setMessages(normalizeIncomingMessages(initialPage.messages));
+        setCursor(initialPage.cursor);
+        setHasMore(initialPage.hasMore);
+        const socket = getSocket('chat', socketToken);
+        socketRef.current = socket;
+
+        const joinRoom = () => {
+          setConnected(true);
+          socket.emit('join', { projectId, ticketId, channel });
+        };
+
+        const handleDisconnect = () => {
+          setConnected(false);
+        };
+
+        const handleNewMessage = (payload: {
+          channel: ChatChannel;
+          message: ChatMessage;
+        }) => {
+          if (payload.channel !== channel) {
+            return;
+          }
+
+          setMessages((current) => {
+            const exists = current.some(
+              (message) => message.id === payload.message.id,
+            );
+
+            if (exists) {
+              return current.map((message) =>
+                message.id === payload.message.id ? payload.message : message,
+              );
+            }
+
+            return [...current, payload.message];
+          });
+        };
+
+        const handleMessagesRead = (payload: {
+          channel: ChatChannel;
+          messageIds: string[];
+          readByUserId: string;
+        }) => {
+          if (payload.channel !== channel) {
+            return;
+          }
+
+          setMessages((current) =>
+            current.map((message) =>
+              payload.messageIds.includes(message.id)
+                ? {
+                    ...message,
+                    isRead: true,
+                    readAt: message.readAt ?? new Date().toISOString(),
+                  }
+                : message,
+            ),
+          );
+        };
+
+        // const handleMessageDeleted = (payload: {
+        //   channel: ChatChannel;
+        //   message: ChatMessage;
+        // }) => {
+        //   if (payload.channel !== channel) {
+        //     return;
+        //   }
+
+        //   setMessages((current) => {
+        //     const exists = current.some(
+        //       (message) => message.id === payload.message.id,
+        //     );
+
+        //     if (exists) {
+        //       return current.map((message) =>
+        //         message.id === payload.message.id ? payload.message : message,
+        //       );
+        //     }
+
+        //     return [...current, payload.message];
+        //   });
+        // };
+
+        const handleMessageDeleted = (payload: {
+          channel: ChatChannel;
+          message: string;
+        }) => {
+          if (payload.channel !== channel) {
+            return;
+          }
+
+          setMessages((current) =>
+            current.filter((message) => message.id !== payload.message),
+          );
+        };
+
+        const applyMessageUpdate = (
+          payload: {
+            channel: ChatChannel;
+            message: {
+              messageId: string;
+              message?: string | null;
+              attachmentUrls?: string[] | null;
+              messageType?: 'text' | 'attachment';
+              attachmentName?: string | null;
+              attachmentSize?: number | null;
+              reactions?: ChatMessageReaction[] | null;
+            };
+          },
+          updateTimestamp = false,
+        ) => {
+          if (
+            payload.channel !== channel ||
+            !payload.message ||
+            typeof payload.message.messageId !== 'string'
+          ) {
+            return;
+          }
+
+          setMessages((current) =>
+            current.map((message) =>
+              message.id === payload.message.messageId
+                ? {
+                    ...message,
+                    message:
+                      typeof payload.message.message === 'string'
+                        ? payload.message.message
+                        : message.message,
+                    messageType:
+                      payload.message.messageType ?? message.messageType,
+                    attachmentUrls:
+                      payload.message.attachmentUrls ?? message.attachmentUrls,
+                    attachmentName:
+                      payload.message.attachmentName ?? message.attachmentName,
+                    attachmentSize:
+                      payload.message.attachmentSize ?? message.attachmentSize,
+                    reactions: payload.message.reactions ?? message.reactions,
+                    ...(updateTimestamp
+                      ? { updatedAt: new Date().toISOString() }
+                      : {}),
+                  }
+                : message,
+            ),
+          );
+        };
+
+        const handleMessageUpdated = (payload: {
+          channel: ChatChannel;
+          message: {
+            messageId: string;
+            message?: string | null;
+            attachmentUrls?: string[] | null;
+            messageType?: 'text' | 'attachment';
+            attachmentName?: string | null;
+            attachmentSize?: number | null;
+            reactions?: ChatMessageReaction[] | null;
+          };
+        }) => {
+          applyMessageUpdate(payload, true);
+        };
+
+        const handleMessageReacted = (payload: {
+          channel: ChatChannel;
+          message: {
+            messageId: string;
+            message?: string | null;
+            attachmentUrls?: string[] | null;
+            messageType?: 'text' | 'attachment';
+            attachmentName?: string | null;
+            attachmentSize?: number | null;
+            reactions?: ChatMessageReaction[] | null;
+          };
+        }) => {
+          applyMessageUpdate(payload);
+        };
+
+        const handleTyping = (payload: {
+          channel: ChatChannel;
+          userId: string;
+          name?: string;
+          isTyping: boolean;
+        }) => {
+          if (payload.channel !== channel) {
+            return;
+          }
+
+          setTypingUsers((current) => {
+            const filtered = current.filter(
+              (user) => user.userId !== payload.userId,
+            );
+
+            if (!payload.isTyping) {
+              return filtered;
+            }
+
+            return [
+              ...filtered,
+              {
+                userId: payload.userId,
+                name: payload.name?.trim() || 'Someone',
+              },
+            ];
+          });
+        };
+
+        socket.on('connect', joinRoom);
+        socket.on('disconnect', handleDisconnect);
+        socket.on('new_message', handleNewMessage);
+        socket.on('messages_read', handleMessagesRead);
+        socket.on('message_deleted', handleMessageDeleted);
+        socket.on('message_updated', handleMessageUpdated);
+        socket.on('message_reacted', handleMessageReacted);
+
+        socket.on('typing', handleTyping);
+
+        if (socket.connected) {
+          joinRoom();
+        }
+
+        setLoading(false);
+
+        return () => {
+          socket.emit('leave', { projectId, ticketId, channel });
+          socket.off('connect', joinRoom);
+          socket.off('disconnect', handleDisconnect);
+          socket.off('new_message', handleNewMessage);
+          socket.off('messages_read', handleMessagesRead);
+          socket.off('message_deleted', handleMessageDeleted);
+          socket.off('message_updated', handleMessageUpdated);
+          socket.off('message_reacted', handleMessageReacted);
+          socket.off('typing', handleTyping);
+        };
+      } catch {
+        if (!isDisposed) {
+          setLoading(false);
+        }
+
+        return undefined;
+      }
+    };
+
+    let cleanup: (() => void) | void;
+
+    void load().then((result) => {
+      cleanup = result;
+    });
+
+    return () => {
+      isDisposed = true;
+      setConnected(false);
+      setTypingUsers([]);
+      setCursor(null);
+      setHasMore(false);
+      setLoadingMore(false);
+
+      if (cleanup) {
+        cleanup();
+      }
+    };
+  }, [channel, enabled, projectId, ticketId]);
+
+  const sendMessage = useCallback(
+    async ({
+      message,
+      messageType = 'text',
+      attachmentUrl,
+      attachmentUrls,
+      attachmentName,
+      attachmentSize,
+      mentionedUserIds,
+    }: SendChatMessagePayload) => {
+      const response = await fetch(
+        `/api/projects/${projectId}/tickets/${ticketId}/chat/${channel}/messages`,
+        {
+          method: 'POST',
+          headers: {
+            Accept: 'application/json',
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            message,
+            messageType,
+            attachmentUrl,
+            attachmentUrls,
+            attachmentName,
+            attachmentSize,
+            mentionedUserIds,
+          }),
+        },
+      );
+
+      const payload = (await response.json().catch(() => null)) as
+        | ChatMessage
+        | { message?: string }
+        | null;
+
+      if (!response.ok || !isChatMessage(payload)) {
+        throw new Error(
+          payload && !Array.isArray(payload) && 'message' in payload
+            ? payload.message || 'Failed to send chat message.'
+            : 'Failed to send chat message.',
+        );
+      }
+
+      setMessages((current) => {
+        const exists = current.some(
+          (currentMessage) => currentMessage.id === payload.id,
+        );
+        return exists ? current : [...current, payload];
+      });
+
+      return payload;
+    },
+    [channel, projectId, ticketId],
+  );
+
+  const markRead = useCallback(
+    async (messageIds: string[]) => {
+      if (!messageIds.length) {
+        return;
+      }
+
+      const response = await fetch(
+        `/api/projects/${projectId}/tickets/${ticketId}/chat/${channel}/messages/read`,
+        {
+          method: 'PATCH',
+          headers: {
+            Accept: 'application/json',
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ messageIds }),
+        },
+      );
+
+      const payload = (await response.json().catch(() => null)) as {
+        success?: boolean;
+        message?: string;
+      } | null;
+
+      if (!response.ok) {
+        throw new Error(payload?.message || 'Failed to mark messages as read.');
+      }
+
+      setMessages((current) =>
+        current.map((message) =>
+          messageIds.includes(message.id)
+            ? {
+                ...message,
+                isRead: true,
+                readAt: message.readAt ?? new Date().toISOString(),
+              }
+            : message,
+        ),
+      );
+    },
+    [channel, projectId, ticketId],
+  );
+
+  const deleteMessage = useCallback(
+    async (messageId: string) => {
+      const response = await fetch(
+        `/api/projects/${projectId}/tickets/${ticketId}/chat/${channel}/messages/${messageId}`,
+        {
+          method: 'DELETE',
+          headers: {
+            Accept: 'application/json',
+          },
+        },
+      );
+
+      const payload = (await response.json().catch(() => null)) as {
+        success?: boolean;
+        message?: string;
+      } | null;
+
+      if (!response.ok) {
+        throw new Error(payload?.message || 'Failed to delete message.');
+      }
+
+      setMessages((current) =>
+        current.filter((message) => message.id !== messageId),
+      );
+    },
+    [channel, projectId, ticketId],
+  );
+
+  const updateMessage = useCallback(
+    async (
+      messageId: string,
+      payload: {
+        message: string;
+        messageType?: 'text' | 'attachment';
+        attachmentUrls?: string[];
+        attachmentName?: string;
+        attachmentSize?: number;
+        mentionedUserIds?: string[];
+      },
+    ) => {
+      const response = await fetch(
+        `/api/projects/${projectId}/tickets/${ticketId}/chat/${channel}/messages/${messageId}`,
+        {
+          method: 'PUT',
+          headers: {
+            Accept: 'application/json',
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(payload),
+        },
+      );
+
+      const updatedMessage = (await response.json().catch(() => null)) as
+        | ChatMessage
+        | { message?: string; success?: boolean }
+        | null;
+
+      if (!response.ok) {
+        throw new Error(
+          updatedMessage &&
+          !Array.isArray(updatedMessage) &&
+          'message' in updatedMessage
+            ? updatedMessage.message || 'Failed to update message.'
+            : 'Failed to update message.',
+        );
+      }
+
+      let nextMessage: ChatMessage | null = null;
+
+      setMessages((current) =>
+        current.map((message) => {
+          if (message.id !== messageId) {
+            return message;
+          }
+
+          nextMessage = isChatMessage(updatedMessage)
+            ? updatedMessage
+            : {
+                ...message,
+                message: payload.message,
+                messageType: payload.messageType ?? message.messageType,
+                attachmentUrls:
+                  payload.attachmentUrls ?? message.attachmentUrls,
+                attachmentName:
+                  payload.attachmentName ?? message.attachmentName,
+                attachmentSize:
+                  payload.attachmentSize ?? message.attachmentSize,
+                updatedAt: new Date().toISOString(),
+              };
+
+          return nextMessage;
+        }),
+      );
+
+      if (nextMessage) {
+        return nextMessage;
+      }
+
+      return {
+        id: messageId,
+        projectId,
+        ticketId,
+        senderId: '',
+        message: payload.message,
+        messageType: payload.messageType ?? 'text',
+        attachmentUrls: payload.attachmentUrls ?? null,
+        attachmentName: payload.attachmentName ?? null,
+        attachmentSize: payload.attachmentSize ?? null,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
+    },
+    [channel, projectId, ticketId],
+  );
+
+  const toggleReaction = useCallback(
+    async ({
+      messageId,
+      emoji,
+      remove,
+    }: {
+      messageId: string;
+      emoji: string;
+      remove: boolean;
+    }) => {
+      const response = await fetch(
+        `/api/projects/${projectId}/tickets/${ticketId}/chat/${channel}/messages/${messageId}/reactions`,
+        {
+          method: remove ? 'DELETE' : 'POST',
+          headers: {
+            Accept: 'application/json',
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ emoji }),
+        },
+      );
+
+      const payload = (await response.json().catch(() => null)) as
+        | ChatMessage
+        | { message?: string; success?: boolean }
+        | null;
+
+      if (!response.ok) {
+        throw new Error(
+          payload && !Array.isArray(payload) && 'message' in payload
+            ? payload.message || 'Failed to update reaction.'
+            : 'Failed to update reaction.',
+        );
+      }
+
+      if (isChatMessage(payload)) {
+        setMessages((current) =>
+          current.map((message) =>
+            message.id === messageId ? payload : message,
+          ),
+        );
+      }
+
+      return payload;
+    },
+    [channel, projectId, ticketId],
+  );
+
+  const setTyping = useCallback(
+    (isTyping: boolean) => {
+      socketRef.current?.emit('typing', {
+        projectId,
+        ticketId,
+        channel,
+        isTyping,
+      });
+    },
+    [channel, projectId, ticketId],
+  );
+
+  const loadOlderMessages = useCallback(async () => {
+    if (!hasMore || loadingMore) {
+      return;
+    }
+
+    setLoadingMore(true);
+
+    try {
+      const nextPage = await fetchMessages(
+        projectId,
+        ticketId,
+        channel,
+        cursor,
+      );
+
+      setMessages((current) => {
+        const nextMessages = normalizeIncomingMessages(nextPage.messages);
+        const messagesById = new Map<string, ChatMessage>();
+
+        [...nextMessages, ...current].forEach((message) => {
+          messagesById.set(message.id, message);
+        });
+
+        return Array.from(messagesById.values());
+      });
+      setCursor(nextPage.cursor);
+      setHasMore(nextPage.hasMore);
+    } finally {
+      setLoadingMore(false);
+    }
+  }, [channel, cursor, hasMore, loadingMore, projectId, ticketId]);
+
+  return {
+    messages,
+    connected,
+    loading,
+    loadingMore,
+    hasMore,
+    typingUsers,
+    sendMessage,
+    markRead,
+    deleteMessage,
+    updateMessage,
+    toggleReaction,
+    setTyping,
+    loadOlderMessages,
+  };
+}

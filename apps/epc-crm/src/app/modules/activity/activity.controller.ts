@@ -1,0 +1,55 @@
+import {
+  Body,
+  Controller,
+//   Delete,
+  Get,
+  Param,
+  Post,
+  Query,
+  UseGuards,
+} from '@nestjs/common';
+
+import { ActivityLogService } from './activity-log.service';
+import { CreateActivityLogDto } from './dto/create-activity-log.dto';
+import { GetActivityLogsDto } from './dto/get-activity-logs.dto';
+import { JwtAuthGuard } from '../../../common/guards/jwt-auth.guard';
+import { ApiBearerAuth } from '@nestjs/swagger';
+import { GetUser } from '../../../common/decorators/get-user.decorator';
+
+@Controller('activity')
+@ApiBearerAuth('JWT-auth')
+@UseGuards(JwtAuthGuard)
+export class ActivityController {
+  constructor(
+    private readonly activityLogService: ActivityLogService,
+  ) {}
+
+  @Post()
+  create(@Body() dto: CreateActivityLogDto) {
+    return this.activityLogService.createActivity(dto);
+  }
+
+  @Get()
+  findAll(@Query() query: GetActivityLogsDto, @GetUser() user) {
+    return this.activityLogService.findAllActivities(query, user);
+  }
+   
+  @Get('project/:projectId/tickets/:ticketId')
+  findTicketActivities(
+    @Param('projectId') projectId: string,
+    @Param('ticketId') ticketId: string,
+    @GetUser() user,
+  ) {
+    return this.activityLogService.findActivityByTicketId(projectId, ticketId, user);
+  }
+
+  @Get(':id')
+  findOne(@Param('id') id: string, @GetUser() user) {
+    return this.activityLogService.findActivityById(id, user);
+  }
+
+//   @Delete(':id')
+//   remove(@Param('id') id: string) {
+//     return this.activityLogService.deleteActivity(id);
+//   }
+}

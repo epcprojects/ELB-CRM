@@ -1,0 +1,148 @@
+'use client';
+
+import { useState, type ChangeEvent, type FormEvent } from 'react';
+import { useAppDispatch, useAppSelector } from '../../Redux/store';
+import { hydrateAuthFromProfile } from '../../Redux/slices/auth/authSlice';
+import { appToast } from '../../../components/toast/AppToast';
+import ThemeButton from '../../../components/ui/ThemeButton';
+import ThemeInput from '../../../components/ui/ThemeInput';
+import DashboardSummaryBanner from '../../../components/ui/DashboardSummaryBanner';
+
+const fallbackAccount = {
+  id: '',
+  fullName: 'Admin',
+  email: 'admin@gmail.com',
+  roles: ['Admin'],
+};
+
+export default function ProfilePage() {
+  const dispatch = useAppDispatch();
+  const user = useAppSelector((state) => state.auth.user);
+  const account = user ?? fallbackAccount;
+
+  const [fullName, setFullName] = useState(account.fullName);
+  const [isSaving, setIsSaving] = useState(false);
+
+  const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+
+    if (!user) {
+      appToast.error('Unable to update profile right now.');
+      return;
+    }
+
+    const normalizedFullName = fullName.trim();
+
+    if (!normalizedFullName) {
+      appToast.error('Full name is required.');
+      return;
+    }
+
+    try {
+      setIsSaving(true);
+
+      const response = await fetch('/api/users/myself', {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+        },
+        body: JSON.stringify({
+          fullName: normalizedFullName,
+        }),
+      });
+
+      const payload = await response.json().catch(() => null);
+
+      if (!response.ok) {
+        throw new Error(payload?.message || 'Failed to update profile.');
+      }
+
+      dispatch(hydrateAuthFromProfile(payload));
+      setFullName(payload.fullName ?? normalizedFullName);
+      appToast.success('Profile updated successfully.');
+    } catch (error) {
+      appToast.error(
+        error instanceof Error ? error.message : 'Failed to update profile.',
+      );
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  return (
+    <>
+      <div className="relative z-100 h-full overflow-hidden pb-0 xl:h-dvh xl:px-0 xl:py-5 xl:pr-5">
+        <div className="flex h-full min-h-0 flex-col gap-3 overflow-y-auto overscroll-contain scrollbar-hide xl:overflow-hidden xl:rounded-2xl xl:border xl:border-white xl:bg-white/40 xl:p-3">
+          <div className="shrink-0">
+            <DashboardSummaryBanner
+              imageSrc="/images/ProfileBanner.svg"
+              imageAlt="Profile"
+              title="Profile"
+              stats={[]}
+            />
+          </div>
+
+          <section className="mx-4 flex h-auto min-h-0 flex-none items-start justify-start flex-col gap-4 overflow-visible rounded-xl bg-white p-4 shadow-[0_0_35px_0_rgb(0_0_0/0.04)] md:p-5 xl:mx-0 xl:h-full xl:flex-1 xl:overflow-hidden">
+            <form
+              className=" flex w-full max-w-200 flex-col gap-5"
+              onSubmit={handleSubmit}
+            >
+              <ProfileField
+                label="Full Name"
+                value={fullName}
+                onChange={(event) => setFullName(event.target.value)}
+                name="fullName"
+                autoComplete="name"
+              />
+
+              <div className="flex justify-end pt-1">
+                <ThemeButton
+                  disabled={isSaving}
+                  type="submit"
+                  className="min-w-36"
+                >
+                  {isSaving ? 'Saving...' : 'Save Changes'}
+                </ThemeButton>
+              </div>
+            </form>
+          </section>
+        </div>
+      </div>
+    </>
+  );
+}
+
+type ProfileFieldProps = {
+  autoComplete?: string;
+  disabled?: boolean;
+  label: string;
+  name: string;
+  onChange?: (event: ChangeEvent<HTMLInputElement>) => void;
+  value: string;
+};
+
+function ProfileField({
+  autoComplete,
+  disabled = false,
+  label,
+  name,
+  onChange,
+  value,
+}: ProfileFieldProps) {
+  return (
+    <div className="grid gap-2 text-sm text-[#344054] xl:grid-cols-[170px_minmax(0,1fr)] xl:items-center xl:gap-6">
+      <span className="font-medium">{label}</span>
+      <ThemeInput
+        autoComplete={autoComplete}
+        className="py-2.5"
+        disabled={disabled}
+        name={name}
+        onChange={onChange}
+        placeholder={label}
+        type="text"
+        value={value}
+      />
+    </div>
+  );
+}

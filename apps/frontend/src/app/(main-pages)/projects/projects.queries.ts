@@ -1,0 +1,2371 @@
+'use client';
+
+import {
+  keepPreviousData,
+  useInfiniteQuery,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from '@tanstack/react-query';
+import {
+  mapApiProjectToProjectRecord,
+  type ProjectRecord,
+  type ApiProjectRecord,
+  type ProjectNameRecord,
+  type ProjectFileRecord,
+} from './projects.data';
+import type { CreateProjectFormValues } from '../../../components/modals/CreateProjectModal';
+import type { UploadFileFormValues } from '../../../components/modals/UploadFileModal';
+import type {
+  DiscussionReaction,
+  DiscussionReply,
+} from '../../../components/discussion/types';
+import type {
+  RecentTicket,
+  TicketPriority,
+  TicketStatus,
+} from '../../../components/tables/RecentTicketsTable';
+import { uploadFilesDirectly } from '../../../lib/attachments';
+import { formatDateTime } from '../../../lib/format';
+import type { LeadStatusCount } from '../../../lib/tickets';
+
+export const projectsQueryKey = ['projects'];
+export const dashboardTicketsQueryKey = ['dashboard-project-tickets'];
+export const projectNamesQueryKey = ['project-names'];
+export const projectThreadQueryKey = ['project-thread'];
+export const projectThreadDetailQueryKey = ['project-thread-detail'];
+export const projectTicketsQueryKey = ['project-tickets'];
+export const projectFilesQueryKey = ['project-files'];
+export const projectNotesQueryKey = ['project-notes'];
+export const projectNoteDetailQueryKey = ['project-note-detail'];
+const PROJECT_THREAD_PAGE_SIZE = 30;
+
+type ProjectThreadDetail = {
+  header: DiscussionReply | null;
+  replies: DiscussionReply[];
+};
+
+export type ProjectThreadCursor = {
+  createdAt: string;
+  id: string;
+};
+
+export type ProjectThreadPage = {
+  threads: DiscussionReply[];
+  cursor: ProjectThreadCursor | null;
+  hasMore: boolean;
+  message?: string;
+};
+
+type ProjectsQueryOptions = {
+  page?: number;
+  limit?: number;
+  search?: string;
+};
+
+type ProjectSummary = {
+  totalProjects: number | null;
+  activeProjects: number | null;
+  totalLeads: number | null;
+  statuses: LeadStatusCount[];
+};
+
+type ProjectsPaginationMeta = {
+  page: number;
+  limit: number;
+  total: number;
+  totalPages: number;
+  hasNext: boolean;
+  hasPrevious: boolean;
+};
+
+type ProjectsResponse = {
+  items: ProjectRecord[];
+  summary: ProjectSummary; //TODO: later on,may need to remove []
+  meta: ProjectsPaginationMeta;
+};
+
+export type ProjectNoteRecord = {
+  id: string;
+  projectId: string;
+  title: string;
+  description: string;
+  createdAt: string | null;
+  updatedAt: string | null;
+  isActive: boolean;
+};
+
+type ProjectNotesResponse = {
+  items: ProjectNoteRecord[];
+  meta: ProjectsPaginationMeta;
+};
+
+export function useProjectsQuery(
+  enabled = true,
+  { page = 1, limit = 100 }: ProjectsQueryOptions = {},
+) {
+  return useQuery({
+    queryKey: [...projectsQueryKey, page, limit],
+    queryFn: () => fetchProjects({ page, limit }),
+    enabled,
+    select: (data) => data.items,
+  });
+}
+
+export function useProjectNamesQuery(enabled = true) {
+  return useQuery({
+    queryKey: projectNamesQueryKey,
+    queryFn: fetchProjectNames,
+    enabled,
+  });
+}
+
+export function useProjectsInfiniteQuery(
+  enabled = true,
+  limit = 12,
+  search = '',
+) {
+  const normalizedSearch = search.trim();
+
+  return useInfiniteQuery({
+    queryKey: [...projectsQueryKey, 'infinite', limit, search],
+    queryFn: ({ pageParam }) =>
+      fetchProjects({
+        page: Number(pageParam),
+        limit,
+        search: normalizedSearch,
+      }),
+    enabled,
+    initialPageParam: 1,
+    // Keep the summary visible while the next search request loads.
+    placeholderData: keepPreviousData,
+    getNextPageParam: (lastPage) =>
+      lastPage.meta.hasNext ? lastPage.meta.page + 1 : undefined,
+  });
+}
+
+export function useProjectDetailQuery(projectId: string, enabled = true) {
+  const queryClient = useQueryClient();
+
+  return useQuery({
+    queryKey: [...projectsQueryKey, projectId],
+    queryFn: () => fetchProjectById(projectId),
+    enabled: Boolean(projectId && enabled),
+    refetchOnMount: 'always',
+    placeholderData: () => {
+      const projectQueries = queryClient.getQueriesData<ProjectRecord[]>({
+        queryKey: projectsQueryKey,
+      });
+
+      return projectQueries
+        .flatMap(([, projects]) => (Array.isArray(projects) ? projects : []))
+        .find((project) => project.id === projectId);
+    },
+  });
+}
+
+export function useCreateProjectMutation() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: createProject,
+    onSuccess: async () => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: projectsQueryKey }),
+        queryClient.invalidateQueries({ queryKey: projectNamesQueryKey }),
+      ]);
+    },
+  });
+}
+
+export function useUpdateProjectMutation() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: updateProject,
+    onSuccess: async (updatedProject, variables) => {
+      queryClient.setQueryData(
+        [...projectsQueryKey, variables.projectId],
+        updatedProject,
+      );
+
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: projectsQueryKey }),
+        queryClient.invalidateQueries({ queryKey: projectNamesQueryKey }),
+        queryClient.invalidateQueries({
+          queryKey: [...projectsQueryKey, variables.projectId],
+        }),
+      ]);
+    },
+  });
+}
+
+export function useDeleteProjectMutation() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: deleteProject,
+    onSuccess: async () => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: projectsQueryKey }),
+        queryClient.invalidateQueries({ queryKey: projectNamesQueryKey }),
+      ]);
+    },
+  });
+}
+
+export function useDeleteTicketMutation() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({
+      projectId,
+      ticketId,
+    }: {
+      projectId: string;
+      ticketId: string;
+    }) => deleteTicket(projectId, ticketId),
+    onSuccess: async () => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: dashboardTicketsQueryKey }),
+        // queryClient.invalidateQueries({ queryKey: projectNamesQueryKey }),
+      ]);
+    },
+  });
+}
+
+export function useProjectThreadQuery(
+  projectId: string,
+  currentUserId = '',
+  enabled = true,
+) {
+  return useQuery({
+    queryKey: [...projectThreadQueryKey, projectId, currentUserId],
+    queryFn: () => fetchProjectThread(projectId, currentUserId),
+    enabled: Boolean(projectId && enabled),
+  });
+}
+
+export function useProjectThreadInfiniteQuery(
+  projectId: string,
+  currentUserId = '',
+  enabled = true,
+) {
+  return useInfiniteQuery({
+    queryKey: [...projectThreadQueryKey, projectId, currentUserId],
+    initialPageParam: null as ProjectThreadCursor | null,
+    queryFn: ({ pageParam }) =>
+      fetchProjectThreadPage(
+        projectId,
+        currentUserId,
+        pageParam as ProjectThreadCursor | null,
+      ),
+    enabled: Boolean(projectId && enabled),
+    getNextPageParam: (lastPage) =>
+      lastPage.hasMore && lastPage.cursor ? lastPage.cursor : undefined,
+  });
+}
+
+export function useProjectThreadDetailQuery(
+  projectId: string,
+  messageId: string,
+  currentUserId = '',
+  enabled = true,
+) {
+  return useQuery({
+    queryKey: [
+      ...projectThreadDetailQueryKey,
+      projectId,
+      messageId,
+      currentUserId,
+    ],
+    queryFn: () =>
+      fetchProjectThreadDetail(projectId, messageId, currentUserId),
+    enabled: Boolean(projectId && messageId && enabled),
+  });
+}
+
+type ProjectTicketsQueryOptions = {
+  page: number;
+  limit: number;
+  search?: string;
+  statusKey?: string;
+  priorityKey?: string;
+  ticketType?: string;
+  contactId?: string;
+  dateFrom?: string;
+  dateTo?: string;
+  reporterId?: string;
+  assigneeId?: string;
+  kanban?: boolean;
+};
+
+type ProjectTicketsResponse = {
+  items: RecentTicket[];
+  countPerStatus: Record<string, number>;
+  meta: {
+    total: number;
+    page: number;
+    limit: number;
+  };
+};
+
+export function useProjectTicketsQuery(
+  projectId: string,
+  {
+    page,
+    limit,
+    search,
+    statusKey,
+    priorityKey,
+    ticketType,
+    contactId,
+    dateFrom,
+    dateTo,
+    reporterId,
+    assigneeId,
+    kanban = false,
+  }: ProjectTicketsQueryOptions,
+  enabled = true,
+) {
+  return useQuery({
+    queryKey: [
+      ...projectTicketsQueryKey,
+      projectId,
+      page,
+      limit,
+      search ?? '',
+      statusKey ?? 'all',
+      priorityKey ?? 'all',
+      ticketType ?? 'all',
+      contactId ?? 'all',
+      dateFrom ?? '',
+      dateTo ?? '',
+      reporterId ?? 'all',
+      assigneeId ?? 'all',
+      kanban,
+    ],
+
+    queryFn: () =>
+      kanban
+        ? fetchProjectTicketsKanban(projectId, { search, priorityKey })
+        : fetchProjectTickets(projectId, {
+            page,
+            limit,
+            search,
+            statusKey,
+            priorityKey,
+            ticketType,
+            contactId,
+            dateFrom,
+            dateTo,
+            reporterId,
+            assigneeId,
+          }),
+
+    enabled: Boolean(projectId && enabled),
+  });
+}
+
+export function useProjectFilesQuery(projectId: string, enabled = true) {
+  return useQuery({
+    queryKey: [...projectFilesQueryKey, projectId],
+    queryFn: () => fetchProjectFiles(projectId),
+    enabled: Boolean(projectId && enabled),
+  });
+}
+
+type ProjectNotesQueryOptions = {
+  page?: number;
+  limit?: number;
+  search?: string;
+};
+
+export function useProjectNotesQuery(
+  projectId: string,
+  { page = 1, limit = 50, search }: ProjectNotesQueryOptions = {},
+  enabled = true,
+) {
+  return useQuery({
+    queryKey: [...projectNotesQueryKey, projectId, page, limit, search ?? ''],
+    queryFn: () =>
+      fetchProjectNotes(projectId, {
+        page,
+        limit,
+        search,
+      }),
+    enabled: Boolean(projectId && enabled),
+  });
+}
+
+export function useCreateProjectNoteMutation() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: createProjectNote,
+    onSuccess: async (createdNote, variables) => {
+      queryClient.setQueriesData<ProjectNotesResponse>(
+        {
+          queryKey: [...projectNotesQueryKey, variables.projectId],
+        },
+        (currentData) => {
+          if (!currentData) {
+            return currentData;
+          }
+
+          const nextItems = [
+            createdNote,
+            ...currentData.items.filter((note) => note.id !== createdNote.id),
+          ];
+
+          return {
+            ...currentData,
+            items: nextItems,
+            meta: {
+              ...currentData.meta,
+              total: Math.max(currentData.meta.total + 1, nextItems.length),
+            },
+          };
+        },
+      );
+
+      await queryClient.invalidateQueries({
+        queryKey: [...projectNotesQueryKey, variables.projectId],
+      });
+    },
+  });
+}
+
+export function useUpdateProjectNoteMutation() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: updateProjectNote,
+    onSuccess: async (_updatedNote, variables) => {
+      queryClient.setQueriesData<ProjectNotesResponse>(
+        {
+          queryKey: [...projectNotesQueryKey, variables.projectId],
+        },
+        (currentData) => {
+          if (!currentData) {
+            return currentData;
+          }
+
+          return {
+            ...currentData,
+            items: currentData.items.map((note) =>
+              note.id === variables.noteId
+                ? {
+                    ...note,
+                    title: variables.values.title.trim(),
+                    description: variables.values.description?.trim() ?? '',
+                  }
+                : note,
+            ),
+          };
+        },
+      );
+
+      await Promise.all([
+        queryClient.invalidateQueries({
+          queryKey: [...projectNotesQueryKey, variables.projectId],
+        }),
+        queryClient.invalidateQueries({
+          queryKey: [
+            ...projectNoteDetailQueryKey,
+            variables.projectId,
+            variables.noteId,
+          ],
+        }),
+      ]);
+    },
+  });
+}
+
+export function useDeleteProjectNoteMutation() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: deleteProjectNote,
+    onSuccess: async (_result, variables) => {
+      queryClient.setQueriesData<ProjectNotesResponse>(
+        {
+          queryKey: [...projectNotesQueryKey, variables.projectId],
+        },
+        (currentData) => {
+          if (!currentData) {
+            return currentData;
+          }
+
+          const nextItems = currentData.items.filter(
+            (note) => note.id !== variables.noteId,
+          );
+
+          return {
+            ...currentData,
+            items: nextItems,
+            meta: {
+              ...currentData.meta,
+              total: Math.max(0, currentData.meta.total - 1),
+            },
+          };
+        },
+      );
+
+      await Promise.all([
+        queryClient.invalidateQueries({
+          queryKey: [...projectNotesQueryKey, variables.projectId],
+        }),
+        queryClient.removeQueries({
+          queryKey: [
+            ...projectNoteDetailQueryKey,
+            variables.projectId,
+            variables.noteId,
+          ],
+        }),
+      ]);
+    },
+  });
+}
+
+export function useProjectNoteDetailQuery(
+  projectId: string,
+  noteId: string,
+  enabled = true,
+) {
+  return useQuery({
+    queryKey: [...projectNoteDetailQueryKey, projectId, noteId],
+    queryFn: () => fetchProjectNoteDetail(projectId, noteId),
+    enabled: Boolean(projectId && noteId && enabled),
+  });
+}
+
+export function useUploadProjectFilesMutation() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: uploadProjectFiles,
+    onSuccess: async (_data, variables) => {
+      await queryClient.invalidateQueries({
+        queryKey: [...projectFilesQueryKey, variables.projectId],
+      });
+    },
+  });
+}
+
+export function useDeleteProjectFileMutation() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: deleteProjectFile,
+    onSuccess: async (_data, variables) => {
+      await queryClient.invalidateQueries({
+        queryKey: [...projectFilesQueryKey, variables.projectId],
+      });
+    },
+  });
+}
+
+async function fetchProjects({
+  page = 1,
+  limit = 100,
+  search,
+}: {
+  page: number;
+  limit: number;
+  search?: string;
+}): Promise<ProjectsResponse> {
+  const searchParams = new URLSearchParams({
+    page: String(page),
+    limit: String(limit),
+  });
+
+  if (search?.trim()) {
+    searchParams.set('search', search.trim());
+  }
+  const response = await fetch(`/api/projects?${searchParams.toString()}`, {
+    method: 'GET',
+    headers: {
+      Accept: 'application/json',
+    },
+    cache: 'no-store',
+  });
+
+  const payload = (await response.json().catch(() => null)) as
+    | ApiProjectRecord[]
+    | {
+        items?: ApiProjectRecord[];
+        summary?: Partial<ProjectSummary>;
+        meta?: Partial<ProjectsPaginationMeta>;
+      }
+    | { message?: string }
+    | null;
+  const projectsResponse = normalizeProjectsResponse(payload, page, limit);
+
+  if (!response.ok || !projectsResponse) {
+    throw new Error(
+      payload && !Array.isArray(payload) && 'message' in payload
+        ? payload.message || 'Failed to fetch projects.'
+        : 'Failed to fetch projects.',
+    );
+  }
+
+  return projectsResponse;
+}
+
+type ApiProjectNameRecord = {
+  id?: string;
+  name?: string;
+};
+
+async function fetchProjectNames(): Promise<ProjectNameRecord[]> {
+  const response = await fetch('/api/projects/names', {
+    method: 'GET',
+    headers: {
+      Accept: 'application/json',
+    },
+    cache: 'no-store',
+  });
+
+  const payload = (await response.json().catch(() => null)) as
+    | ApiProjectNameRecord[]
+    | { message?: string }
+    | null;
+
+  if (!response.ok || !Array.isArray(payload)) {
+    throw new Error(
+      !Array.isArray(payload)
+        ? payload?.message || 'Failed to fetch project names.'
+        : 'Failed to fetch project names.',
+    );
+  }
+
+  return payload
+    .flatMap((project) => {
+      const id = project.id?.trim();
+      const name = project.name?.trim();
+
+      if (!id || !name) {
+        return [];
+      }
+
+      return [{ id, name }];
+    })
+    .sort((left, right) =>
+      left.name.localeCompare(right.name, undefined, { sensitivity: 'base' }),
+    );
+}
+
+function normalizeProjectsResponse(
+  payload:
+    | ApiProjectRecord[]
+    | {
+        items?: ApiProjectRecord[];
+        summary?: Partial<ProjectSummary>;
+        meta?: Partial<ProjectsPaginationMeta>;
+      }
+    | { message?: string }
+    | null,
+  page: number,
+  limit: number,
+): ProjectsResponse | null {
+  if (Array.isArray(payload)) {
+    return {
+      items: payload.map(mapApiProjectToProjectRecord),
+      summary: {
+        totalProjects: payload.length,
+        activeProjects: payload.length,
+        totalLeads: 0,
+        statuses: [],
+      },
+      meta: {
+        page,
+        limit,
+        total: payload.length,
+        totalPages: 1,
+        hasNext: false,
+        hasPrevious: page > 1,
+      },
+    };
+  }
+
+  if (!payload || typeof payload !== 'object' || !('items' in payload)) {
+    return null;
+  }
+
+  if (!Array.isArray(payload.items)) {
+    return null;
+  }
+
+  return {
+    items: payload.items.map(mapApiProjectToProjectRecord),
+    summary: {
+      totalProjects:
+        payload.summary?.totalProjects ??
+        payload.meta?.total ??
+        payload.items.length,
+
+      activeProjects: payload.summary?.activeProjects ?? 0,
+
+      totalLeads: payload.summary?.totalLeads ?? 0,
+
+      statuses: payload.summary?.statuses ?? [],
+    },
+    meta: {
+      page: payload.meta?.page ?? page,
+      limit: payload.meta?.limit ?? limit,
+      total: payload.meta?.total ?? payload.items.length,
+      totalPages: payload.meta?.totalPages ?? 1,
+      hasNext: payload.meta?.hasNext ?? false,
+      hasPrevious: payload.meta?.hasPrevious ?? page > 1,
+    },
+  };
+}
+
+async function fetchProjectById(projectId: string) {
+  const response = await fetch(`/api/projects/${projectId}`, {
+    method: 'GET',
+    headers: {
+      Accept: 'application/json',
+    },
+    cache: 'no-store',
+  });
+
+  const payload = (await response.json().catch(() => null)) as
+    | ApiProjectRecord
+    | { message?: string }
+    | null;
+
+  if (!response.ok || !isApiProjectRecord(payload)) {
+    const error = new Error(
+      isProjectErrorPayload(payload)
+        ? payload.message || 'Failed to fetch project.'
+        : 'Failed to fetch project.',
+    ) as Error & { status?: number };
+
+    error.status = response.status;
+
+    throw error;
+  }
+
+  return mapApiProjectToProjectRecord(payload);
+}
+
+type ApiProjectNoteRecord = {
+  id?: string;
+  projectId?: string;
+  title?: string | null;
+  description?: string | null;
+  createdAt?: string | null;
+  updatedAt?: string | null;
+  isActive?: boolean | null;
+};
+
+async function fetchProjectNotes(
+  projectId: string,
+  { page = 1, limit = 50, search }: ProjectNotesQueryOptions,
+): Promise<ProjectNotesResponse> {
+  const searchParams = new URLSearchParams({
+    page: String(page),
+    limit: String(limit),
+  });
+
+  if (search?.trim()) {
+    searchParams.set('search', search.trim());
+  }
+
+  const response = await fetch(
+    `/api/projects/${projectId}/notes?${searchParams.toString()}`,
+    {
+      method: 'GET',
+      headers: {
+        Accept: 'application/json',
+      },
+      cache: 'no-store',
+    },
+  );
+
+  const payload = (await response.json().catch(() => null)) as
+    | {
+        items?: ApiProjectNoteRecord[];
+        meta?: Partial<ProjectsPaginationMeta>;
+        message?: string;
+      }
+    | { message?: string }
+    | null;
+
+  const noteItems =
+    payload && typeof payload === 'object' && 'items' in payload
+      ? payload.items
+      : undefined;
+  const noteMeta =
+    payload && typeof payload === 'object' && 'meta' in payload
+      ? payload.meta
+      : undefined;
+
+  if (!response.ok || !Array.isArray(noteItems)) {
+    throw new Error(payload?.message || 'Failed to fetch project notes.');
+  }
+
+  return {
+    items: noteItems.flatMap((item) => {
+      const id = item.id?.trim();
+      const currentProjectId = item.projectId?.trim() || projectId;
+      const title = item.title?.trim();
+
+      if (!id || !title) {
+        return [];
+      }
+
+      return [
+        {
+          id,
+          projectId: currentProjectId,
+          title,
+          description: item.description?.trim() ?? '',
+          createdAt: item.createdAt ?? null,
+          updatedAt: item.updatedAt ?? null,
+          isActive: item.isActive ?? true,
+        },
+      ];
+    }),
+    meta: {
+      page: noteMeta?.page ?? page,
+      limit: noteMeta?.limit ?? limit,
+      total: noteMeta?.total ?? noteItems.length,
+      totalPages: noteMeta?.totalPages ?? 1,
+      hasNext: noteMeta?.hasNext ?? false,
+      hasPrevious: noteMeta?.hasPrevious ?? page > 1,
+    },
+  };
+}
+
+async function createProjectNote({
+  projectId,
+  values,
+}: {
+  projectId: string;
+  values: {
+    title: string;
+    description?: string;
+  };
+}): Promise<ProjectNoteRecord> {
+  const response = await fetch(`/api/projects/${projectId}/notes`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+    },
+    body: JSON.stringify({
+      title: values.title.trim(),
+      description: values.description?.trim() || undefined,
+    }),
+  });
+
+  const payload = (await response.json().catch(() => null)) as
+    | ApiProjectNoteRecord
+    | { message?: string }
+    | null;
+  const errorMessage =
+    payload && typeof payload === 'object' && 'message' in payload
+      ? payload.message
+      : undefined;
+
+  if (!response.ok) {
+    throw new Error(errorMessage || 'Failed to create project note.');
+  }
+
+  const id =
+    payload && typeof payload === 'object' && 'id' in payload
+      ? payload.id?.trim()
+      : '';
+  const currentProjectId =
+    payload && typeof payload === 'object' && 'projectId' in payload
+      ? payload.projectId?.trim()
+      : projectId;
+  const title =
+    payload && typeof payload === 'object' && 'title' in payload
+      ? payload.title?.trim()
+      : values.title.trim();
+
+  if (!id || !currentProjectId || !title) {
+    throw new Error('Failed to create project note.');
+  }
+
+  return {
+    id,
+    projectId: currentProjectId,
+    title,
+    description:
+      payload && typeof payload === 'object' && 'description' in payload
+        ? (payload.description?.trim() ?? '')
+        : (values.description?.trim() ?? ''),
+    createdAt:
+      payload && typeof payload === 'object' && 'createdAt' in payload
+        ? (payload.createdAt ?? null)
+        : null,
+    updatedAt:
+      payload && typeof payload === 'object' && 'updatedAt' in payload
+        ? (payload.updatedAt ?? null)
+        : null,
+    isActive:
+      payload && typeof payload === 'object' && 'isActive' in payload
+        ? (payload.isActive ?? true)
+        : true,
+  };
+}
+
+async function fetchProjectNoteDetail(
+  projectId: string,
+  noteId: string,
+): Promise<ProjectNoteRecord> {
+  const response = await fetch(`/api/projects/${projectId}/notes/${noteId}`, {
+    method: 'GET',
+    headers: {
+      Accept: 'application/json',
+    },
+    cache: 'no-store',
+  });
+
+  const payload = (await response.json().catch(() => null)) as
+    | ApiProjectNoteRecord
+    | { message?: string }
+    | null;
+  const errorMessage =
+    payload && typeof payload === 'object' && 'message' in payload
+      ? payload.message
+      : undefined;
+
+  if (!response.ok) {
+    throw new Error(errorMessage || 'Failed to fetch project note.');
+  }
+
+  const id =
+    payload && typeof payload === 'object' && 'id' in payload
+      ? payload.id?.trim()
+      : '';
+  const currentProjectId =
+    payload && typeof payload === 'object' && 'projectId' in payload
+      ? payload.projectId?.trim()
+      : '';
+  const title =
+    payload && typeof payload === 'object' && 'title' in payload
+      ? payload.title?.trim()
+      : '';
+
+  if (!id || !currentProjectId || !title) {
+    throw new Error('Failed to fetch project note.');
+  }
+
+  return {
+    id,
+    projectId: currentProjectId,
+    title,
+    description:
+      payload && typeof payload === 'object' && 'description' in payload
+        ? (payload.description?.trim() ?? '')
+        : '',
+    createdAt:
+      payload && typeof payload === 'object' && 'createdAt' in payload
+        ? (payload.createdAt ?? null)
+        : null,
+    updatedAt:
+      payload && typeof payload === 'object' && 'updatedAt' in payload
+        ? (payload.updatedAt ?? null)
+        : null,
+    isActive:
+      payload && typeof payload === 'object' && 'isActive' in payload
+        ? (payload.isActive ?? true)
+        : true,
+  };
+}
+
+async function updateProjectNote({
+  projectId,
+  noteId,
+  values,
+}: {
+  projectId: string;
+  noteId: string;
+  values: {
+    title: string;
+    description?: string;
+  };
+}): Promise<ProjectNoteRecord> {
+  const response = await fetch(`/api/projects/${projectId}/notes/${noteId}`, {
+    method: 'PATCH',
+    headers: {
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+    },
+    body: JSON.stringify({
+      title: values.title.trim(),
+      description: values.description?.trim() || undefined,
+    }),
+  });
+
+  const payload = (await response.json().catch(() => null)) as
+    | ApiProjectNoteRecord
+    | { message?: string }
+    | null;
+  const errorMessage =
+    payload && typeof payload === 'object' && 'message' in payload
+      ? payload.message
+      : undefined;
+
+  if (!response.ok) {
+    throw new Error(errorMessage || 'Failed to update project note.');
+  }
+
+  const id =
+    payload && typeof payload === 'object' && 'id' in payload
+      ? payload.id?.trim()
+      : noteId;
+  const currentProjectId =
+    payload && typeof payload === 'object' && 'projectId' in payload
+      ? payload.projectId?.trim()
+      : projectId;
+  const title =
+    payload && typeof payload === 'object' && 'title' in payload
+      ? payload.title?.trim()
+      : values.title.trim();
+
+  if (!id || !currentProjectId || !title) {
+    throw new Error('Failed to update project note.');
+  }
+
+  return {
+    id,
+    projectId: currentProjectId,
+    title,
+    description:
+      payload && typeof payload === 'object' && 'description' in payload
+        ? (payload.description?.trim() ?? '')
+        : (values.description?.trim() ?? ''),
+    createdAt:
+      payload && typeof payload === 'object' && 'createdAt' in payload
+        ? (payload.createdAt ?? null)
+        : null,
+    updatedAt:
+      payload && typeof payload === 'object' && 'updatedAt' in payload
+        ? (payload.updatedAt ?? null)
+        : null,
+    isActive:
+      payload && typeof payload === 'object' && 'isActive' in payload
+        ? (payload.isActive ?? true)
+        : true,
+  };
+}
+
+async function deleteProjectNote({
+  projectId,
+  noteId,
+}: {
+  projectId: string;
+  noteId: string;
+}) {
+  const response = await fetch(`/api/projects/${projectId}/notes/${noteId}`, {
+    method: 'DELETE',
+    headers: {
+      Accept: 'application/json',
+    },
+  });
+
+  const payload = await response.json().catch(() => null);
+
+  if (!response.ok) {
+    throw new Error(payload?.message || 'Failed to delete project note.');
+  }
+
+  return payload;
+}
+async function createProject(values: CreateProjectFormValues) {
+  const validAttachments = values.attachments.filter(
+    (attachment) => attachment.size > 0,
+  );
+  const uploadedAttachments = validAttachments.length
+    ? await uploadFilesDirectly(validAttachments, 'projects/creation')
+    : [];
+
+  const response = await fetch('/api/projects', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+    },
+    body: JSON.stringify({
+      name: values.name,
+      category: values.category.toLowerCase(),
+      brandColor: values.colorHex,
+      logoLetter: getProjectLogoLetter(values.name),
+      attachments: uploadedAttachments,
+    }),
+  });
+
+  const payload = await response.json().catch(() => null);
+
+  if (!response.ok) {
+    throw new Error(payload?.message || 'Failed to create project.');
+  }
+
+  return payload;
+}
+
+async function updateProject({
+  projectId,
+  values,
+}: {
+  projectId: string;
+  values: CreateProjectFormValues;
+}) {
+  const response = await fetch(`/api/projects/${projectId}`, {
+    method: 'PATCH',
+    headers: {
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+    },
+    body: JSON.stringify({
+      name: values.name,
+      category: values.category.toLowerCase(),
+      brandColor: values.colorHex,
+      logoLetter: getProjectLogoLetter(values.name),
+    }),
+  });
+
+  const payload = await response.json().catch(() => null);
+
+  if (!response.ok) {
+    throw new Error(payload?.message || 'Failed to update project.');
+  }
+
+  if (isApiProjectRecord(payload)) {
+    return mapApiProjectToProjectRecord(payload);
+  }
+
+  return {
+    id: projectId,
+    name: values.name,
+    category: values.category,
+    colorHex: values.colorHex,
+    initials: getInitials(values.name),
+  } as ProjectRecord;
+}
+
+async function deleteProject(projectId: string) {
+  const response = await fetch(`/api/projects/${projectId}`, {
+    method: 'DELETE',
+    headers: {
+      Accept: 'application/json',
+    },
+  });
+
+  const payload = await response.json().catch(() => null);
+
+  if (!response.ok) {
+    throw new Error(payload?.message || 'Failed to delete project.');
+  }
+
+  return payload;
+}
+
+async function deleteTicket(projectId: string, ticketId: string) {
+  const response = await fetch(
+    `/api/projects/${projectId}/tickets/${ticketId}`,
+    {
+      method: 'DELETE',
+      headers: {
+        Accept: 'application/json',
+      },
+    },
+  );
+
+  const payload = await response.json().catch(() => null);
+
+  if (!response.ok) {
+    throw new Error(payload?.message || 'Failed to delete lead.');
+  }
+
+  return payload;
+}
+
+function getProjectLogoLetter(name: string) {
+  return name.replace(/\s+/g, '').slice(0, 2).toLowerCase();
+}
+
+function isApiProjectRecord(value: unknown): value is ApiProjectRecord {
+  return Boolean(
+    value &&
+      typeof value === 'object' &&
+      'id' in value &&
+      'name' in value &&
+      'category' in value &&
+      'brandColor' in value &&
+      'logoLetter' in value,
+  );
+}
+
+function isProjectErrorPayload(value: unknown): value is { message?: string } {
+  return Boolean(value && typeof value === 'object' && 'message' in value);
+}
+
+type ApiProjectThreadMessage = {
+  id: string;
+  createdAt: string;
+  updatedAt: string;
+  deletedAt?: string | null;
+  isActive?: boolean;
+  createdBy: string | null;
+  updatedBy: string | null;
+  projectId?: string;
+  authorId?: string;
+  message: string | null;
+  mentionedUserIds?: string[] | null;
+  replyCount?: string | number | null;
+  author?: {
+    email?: string;
+    fullName?: string;
+    name?: string;
+  } | null;
+  attachments?: ApiDiscussionAttachment[];
+  reactions?: ApiProjectThreadReaction[] | null;
+  parentReactions?: ApiProjectThreadReaction[] | null;
+  replies?: ApiProjectThreadMessage[];
+};
+
+type ApiProjectThreadResponse = {
+  threads?: ApiProjectThreadMessage[];
+  cursor?: {
+    createdAt?: string | null;
+    id?: string | null;
+  } | null;
+  hasMore?: boolean | null;
+  message?: string;
+};
+
+type ApiProjectThreadReactionActor = {
+  id?: string | null;
+  fullName?: string | null;
+  name?: string | null;
+};
+
+type ApiProjectThreadReaction = {
+  emoji?: string | null;
+  count?: string | number | null;
+  reactedByCurrentUser?: boolean | null;
+  isCurrentUser?: boolean | null;
+  userReacted?: boolean | null;
+  actors?: ApiProjectThreadReactionActor[] | null;
+};
+
+type ApiDiscussionAttachment = {
+  id?: string;
+  originalName?: string;
+  name?: string;
+  storageKey?: string | null;
+  sizeBytes?: string | number | null;
+  extension?: string | null;
+  mimeType?: string | null;
+};
+
+type ApiProjectTicket = {
+  id: string;
+  ticketRefNo?: string;
+  createdAt: string;
+  updatedAt?: string;
+  deletedAt?: string | null;
+  isActive?: boolean;
+  createdBy?: string | null;
+  updatedBy?: string | null;
+  projectId?: string;
+  title: string;
+  description?: string;
+  statusKey?: string | null;
+  priorityKey?: string | null;
+  reporterId?: string | null;
+  assigneeId?: string | null;
+  ticketType?: string | null;
+  dueDate?: string | null;
+  project?: {
+    id?: string;
+    name?: string;
+    brandColor?: string;
+  } | null;
+  status?: {
+    key?: string;
+    label?: string;
+    color?: string;
+  } | null;
+  priority?: {
+    key?: string;
+    label?: string;
+    color?: string;
+  } | null;
+  assignee?: {
+    id?: string;
+    email?: string;
+    fullName?: string;
+    name?: string;
+  } | null;
+  reporter?: {
+    id: string;
+    email: string;
+    fullName: string;
+  };
+  contact?: {
+    id: string;
+    fullName: string | null;
+    phone: string;
+  } | null;
+};
+
+type ApiProjectFile = {
+  id?: string;
+  projectId?: string | null;
+  name?: string;
+  fileName?: string;
+  originalName?: string;
+  type?: string;
+  mimeType?: string;
+  size?: string | number | null;
+  sizeBytes?: string | number | null;
+  extension?: string | null;
+  uploadedBy?: string | null;
+  createdBy?: string | null;
+  uploadedAt?: string | null;
+  createdAt?: string | null;
+  updatedAt?: string | null;
+  thumbnailKey?: string | null;
+  storageKey?: string | null;
+  source?: string | null;
+  sourceId?: string | null;
+  status?: string | null;
+};
+
+type ApiProjectTicketsResponse = {
+  items: ApiProjectTicket[];
+  meta: {
+    total: number;
+    page: number;
+    limit: number;
+  };
+};
+
+type ApiProjectTicketsKanbanResponse = {
+  items: Record<string, ApiProjectTicket[]>;
+  countPerStatus?: Record<string, number>;
+};
+
+async function fetchProjectThread(projectId: string, currentUserId: string) {
+  const page = await fetchProjectThreadPage(projectId, currentUserId, null);
+  return page.threads;
+}
+
+async function fetchProjectThreadPage(
+  projectId: string,
+  currentUserId: string,
+  cursor: ProjectThreadCursor | null,
+): Promise<ProjectThreadPage> {
+  const searchParams = new URLSearchParams({
+    limit: String(PROJECT_THREAD_PAGE_SIZE),
+  });
+
+  if (cursor?.createdAt) {
+    searchParams.set('cursorCreatedAt', cursor.createdAt);
+  }
+
+  if (cursor?.id) {
+    searchParams.set('cursorId', cursor.id);
+  }
+
+  const response = await fetch(
+    `/api/projects/${projectId}/thread?${searchParams.toString()}`,
+    {
+      method: 'GET',
+      headers: {
+        Accept: 'application/json',
+      },
+      cache: 'no-store',
+    },
+  );
+
+  const payload = (await response.json().catch(() => null)) as
+    | ApiProjectThreadResponse
+    | ApiProjectThreadMessage[]
+    | { message?: string }
+    | null;
+
+  const normalizedPayload = normalizeProjectThreadResponse(
+    payload,
+    currentUserId,
+  );
+
+  if (!response.ok || !normalizedPayload) {
+    throw new Error(
+      normalizedPayload?.message || 'Failed to fetch project thread.',
+    );
+  }
+
+  return normalizedPayload;
+}
+
+function normalizeProjectThreadResponse(
+  payload:
+    | ApiProjectThreadResponse
+    | ApiProjectThreadMessage[]
+    | { message?: string }
+    | null,
+  currentUserId: string,
+): ProjectThreadPage | null {
+  if (Array.isArray(payload)) {
+    return {
+      threads: payload.map((message) =>
+        mapApiProjectThreadMessageToReply(message, currentUserId),
+      ),
+      cursor: null,
+      hasMore: false,
+    };
+  }
+
+  if (!isApiProjectThreadResponse(payload)) {
+    return payload && 'message' in payload
+      ? {
+          message: payload.message || 'Failed to fetch project thread.',
+          threads: [],
+          cursor: null,
+          hasMore: false,
+        }
+      : null;
+  }
+
+  return {
+    threads: payload.threads.map((message) =>
+      mapApiProjectThreadMessageToReply(message, currentUserId),
+    ),
+    cursor:
+      payload.cursor?.id && payload.cursor?.createdAt
+        ? {
+            id: payload.cursor.id,
+            createdAt: payload.cursor.createdAt,
+          }
+        : null,
+    hasMore: Boolean(payload.hasMore),
+  };
+}
+
+export function flattenProjectThreadPages(
+  pages: ProjectThreadPage[] | undefined,
+): DiscussionReply[] {
+  if (!pages?.length) {
+    return [];
+  }
+
+  const repliesById = new Map<string, DiscussionReply>();
+
+  pages
+    .slice()
+    .reverse()
+    .forEach((page) => {
+      page.threads
+        .slice()
+        .reverse()
+        .forEach((thread) => {
+          repliesById.set(thread.id, thread);
+        });
+    });
+
+  return Array.from(repliesById.values());
+}
+
+async function fetchProjectThreadDetail(
+  projectId: string,
+  messageId: string,
+  currentUserId: string,
+) {
+  const response = await fetch(
+    `/api/projects/${projectId}/thread/${messageId}`,
+    {
+      method: 'GET',
+      headers: {
+        Accept: 'application/json',
+      },
+      cache: 'no-store',
+    },
+  );
+
+  const payload = (await response.json().catch(() => null)) as unknown;
+
+  if (!response.ok) {
+    throw new Error(
+      isProjectErrorPayload(payload)
+        ? payload.message || 'Failed to fetch thread details.'
+        : 'Failed to fetch thread details.',
+    );
+  }
+
+  return normalizeProjectThreadDetail(payload, messageId, currentUserId);
+}
+
+async function fetchProjectTickets(
+  projectId: string,
+  {
+    page,
+    limit,
+    search,
+    statusKey,
+    priorityKey,
+    ticketType,
+    contactId,
+    dateFrom,
+    dateTo,
+    reporterId,
+    assigneeId,
+  }: ProjectTicketsQueryOptions,
+): Promise<ProjectTicketsResponse> {
+  const searchParams = new URLSearchParams({
+    page: String(page),
+    limit: String(limit),
+  });
+
+  if (search?.trim()) {
+    searchParams.set('search', search.trim());
+  }
+
+  if (statusKey) {
+    searchParams.set('statusKey', statusKey);
+  }
+
+  if (priorityKey) {
+    searchParams.set('priorityKey', priorityKey);
+  }
+
+  if (ticketType) {
+    searchParams.set('ticketType', ticketType);
+  }
+
+  if (contactId) {
+    searchParams.set('contactId', contactId);
+  }
+
+  if (dateFrom) {
+    searchParams.set('dateFrom', dateFrom);
+  }
+
+  if (dateTo) {
+    searchParams.set('dateTo', dateTo);
+  }
+
+  if (reporterId) {
+    searchParams.set('reporterId', reporterId);
+  }
+
+  if (assigneeId) {
+    searchParams.set('assigneeId', assigneeId);
+  }
+
+  const response = await fetch(
+    `/api/projects/${projectId}/tickets?${searchParams.toString()}`,
+    {
+      method: 'GET',
+      headers: {
+        Accept: 'application/json',
+      },
+      cache: 'no-store',
+    },
+  );
+
+  const payload = (await response.json().catch(() => null)) as
+    | ApiProjectTicketsResponse
+    | { message?: string }
+    | null;
+
+  if (!response.ok || !isApiProjectTicketsResponse(payload)) {
+    throw new Error(
+      isProjectErrorPayload(payload)
+        ? payload.message || 'Failed to fetch project leads.'
+        : 'Failed to fetch project leads.',
+    );
+  }
+
+  return {
+    items: payload.items.map(mapApiProjectTicketToRecentTicket),
+    countPerStatus: {},
+    meta: payload.meta,
+  };
+}
+
+async function fetchProjectTicketsKanban(
+  projectId: string,
+  {
+    search,
+    priorityKey,
+  }: Pick<ProjectTicketsQueryOptions, 'search' | 'priorityKey'>,
+): Promise<ProjectTicketsResponse> {
+  const searchParams = new URLSearchParams();
+
+  searchParams.append('projectIds', projectId);
+
+  if (search?.trim()) {
+    searchParams.set('search', search.trim());
+  }
+
+  if (priorityKey) {
+    searchParams.set('priorityKey', priorityKey);
+  }
+
+  const response = await fetch(
+    `/api/dashboard/tickets/kanban?${searchParams.toString()}`,
+    {
+      method: 'GET',
+      headers: {
+        Accept: 'application/json',
+      },
+      cache: 'no-store',
+    },
+  );
+
+  const payload = (await response.json().catch(() => null)) as
+    | ApiProjectTicketsKanbanResponse
+    | { message?: string }
+    | null;
+
+  if (!response.ok || !isApiProjectTicketsKanbanResponse(payload)) {
+    throw new Error(
+      isProjectErrorPayload(payload)
+        ? payload.message || 'Failed to fetch project Kanban leads.'
+        : 'Failed to fetch project Kanban leads.',
+    );
+  }
+
+  const tickets = Object.values(payload.items).flat();
+
+  return {
+    items: tickets.map(mapApiProjectTicketToRecentTicket),
+    countPerStatus: payload.countPerStatus ?? {},
+    meta: {
+      total: tickets.length,
+      page: 1,
+      limit: tickets.length,
+    },
+  };
+}
+export type ProjectKanbanBoardData = {
+  items: Record<string, RecentTicket[]>;
+  hasMore: Record<string, boolean>;
+  pageByStatus: Record<string, number>;
+};
+
+export type ApiProjectKanbanBoardResponse = {
+  items: Record<string, ApiProjectTicket[]> | ApiProjectTicket[];
+  hasMore?: Record<string, boolean> | boolean;
+  statusKey?: string;
+};
+
+export type ApiProjectKanbanCountsResponse = {
+  countPerStatus: Record<string, number>;
+};
+export async function fetchProjectKanbanCounts({
+  projectId,
+  priorityKey,
+  ticketType,
+  search,
+  contactId,
+  reporterId,
+  assigneeId,
+}: {
+  projectId: string;
+  priorityKey?: string;
+  ticketType?: string;
+  search?: string;
+  contactId?: string;
+  reporterId?: string;
+  assigneeId?: string;
+}) {
+  const searchParams = new URLSearchParams();
+
+  // Single project bhi array query ke format mein jayega
+  searchParams.append('projectIds', projectId);
+
+  if (priorityKey?.trim()) {
+    searchParams.set('priorityKey', priorityKey.trim());
+  }
+  if (ticketType?.trim()) {
+    searchParams.set('ticketType', ticketType.trim());
+  }
+  if (search?.trim()) {
+    searchParams.set('search', search.trim());
+  }
+  if (contactId) {
+    searchParams.set('contactId', contactId);
+  }
+  if (reporterId) {
+    searchParams.set('reporterId', reporterId);
+  }
+  if (assigneeId) {
+    searchParams.set('assigneeId', assigneeId);
+  }
+
+  const response = await fetch(
+    `/api/dashboard/kanban-ticket-counts?${searchParams.toString()}`,
+    {
+      method: 'GET',
+      headers: {
+        Accept: 'application/json',
+      },
+      cache: 'no-store',
+    },
+  );
+
+  const payload = (await response.json().catch(() => null)) as
+    | ApiProjectKanbanCountsResponse
+    | { message?: string }
+    | null;
+
+  if (!response.ok || !payload || !('countPerStatus' in payload)) {
+    throw new Error(
+      payload && 'message' in payload
+        ? payload.message || 'Failed to fetch project Kanban counts.'
+        : 'Failed to fetch project Kanban counts.',
+    );
+  }
+
+  return payload.countPerStatus;
+}
+export async function fetchProjectKanbanBoard({
+  projectId,
+  priorityKey,
+  ticketType,
+  search,
+  statusKey,
+  contactId,
+  reporterId,
+  assigneeId,
+  page = 1,
+  limit = 20,
+}: {
+  projectId: string;
+  priorityKey?: string;
+  ticketType?: string;
+  search?: string;
+  statusKey?: string;
+  contactId?: string;
+  reporterId?: string;
+  assigneeId?: string;
+  page?: number;
+  limit?: number;
+}): Promise<ProjectKanbanBoardData> {
+  const searchParams = new URLSearchParams({
+    limit: String(limit),
+  });
+
+  searchParams.append('projectIds', projectId);
+
+  if (priorityKey?.trim()) {
+    searchParams.set('priorityKey', priorityKey.trim());
+  }
+  if (ticketType?.trim()) {
+    searchParams.set('ticketType', ticketType.trim());
+  }
+  if (search?.trim()) {
+    searchParams.set('search', search.trim());
+  }
+  if (contactId) {
+    searchParams.set('contactId', contactId);
+  }
+  if (reporterId) {
+    searchParams.set('reporterId', reporterId);
+  }
+  if (assigneeId) {
+    searchParams.set('assigneeId', assigneeId);
+  }
+
+  // Initial request mein statusKey/page nahi jayega
+  if (statusKey) {
+    searchParams.set('statusKey', statusKey);
+    searchParams.set('page', String(page));
+  }
+
+  const response = await fetch(
+    `/api/dashboard/kanban-board?${searchParams.toString()}`,
+    {
+      method: 'GET',
+      headers: {
+        Accept: 'application/json',
+      },
+      cache: 'no-store',
+    },
+  );
+
+  const payload = (await response.json().catch(() => null)) as
+    | ApiProjectKanbanBoardResponse
+    | { message?: string }
+    | null;
+
+  if (!response.ok || !payload || !('items' in payload) || !payload.items) {
+    throw new Error(
+      payload && 'message' in payload
+        ? payload.message || 'Failed to fetch project Kanban board.'
+        : 'Failed to fetch project Kanban board.',
+    );
+  }
+
+  const normalizedItems: Record<string, ApiProjectTicket[]> = Array.isArray(
+    payload.items,
+  )
+    ? {
+        [statusKey ?? payload.statusKey ?? 'Unknown']: payload.items,
+      }
+    : payload.items;
+
+  const mappedItems = Object.fromEntries(
+    Object.entries(normalizedItems).map(([currentStatusKey, tickets]) => [
+      currentStatusKey,
+      Array.isArray(tickets)
+        ? tickets.map(mapApiProjectTicketToRecentTicket)
+        : [],
+    ]),
+  );
+
+  const normalizedHasMore =
+    typeof payload.hasMore === 'boolean'
+      ? {
+          [statusKey ?? payload.statusKey ?? 'Unknown']: payload.hasMore,
+        }
+      : (payload.hasMore ?? {});
+
+  return {
+    items: mappedItems,
+    hasMore: normalizedHasMore,
+    pageByStatus: Object.fromEntries(
+      Object.keys(mappedItems).map((key) => [key, statusKey ? page : 1]),
+    ),
+  };
+}
+async function fetchProjectFiles(projectId: string) {
+  const response = await fetch(`/api/projects/${projectId}/files`, {
+    method: 'GET',
+    headers: {
+      Accept: 'application/json',
+    },
+    cache: 'no-store',
+  });
+
+  const payload = (await response.json().catch(() => null)) as
+    | ApiProjectFile[]
+    | { message?: string }
+    | null;
+
+  if (!response.ok || !Array.isArray(payload)) {
+    throw new Error(
+      !Array.isArray(payload)
+        ? payload?.message
+        : 'Failed to fetch project files.',
+    );
+  }
+
+  return payload.map(mapApiProjectFileToProjectFileRecord);
+}
+
+async function uploadProjectFiles({
+  projectId,
+  values,
+}: {
+  projectId: string;
+  values: UploadFileFormValues;
+}) {
+  const uploadedAttachments = await uploadFilesDirectly(
+    values.attachments,
+    `projects/${projectId}/files`,
+  );
+
+  const response = await fetch(`/api/projects/${projectId}/files`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ attachments: uploadedAttachments }),
+  });
+
+  const payload = await response.json().catch(() => null);
+
+  if (!response.ok) {
+    throw new Error(payload?.message || 'Failed to upload project files.');
+  }
+
+  return payload;
+}
+
+async function deleteProjectFile({
+  projectId,
+  fileId,
+}: {
+  projectId: string;
+  fileId: string;
+}) {
+  const response = await fetch(`/api/projects/${projectId}/files/${fileId}`, {
+    method: 'DELETE',
+    headers: {
+      Accept: 'application/json',
+    },
+  });
+
+  const payload = await response.json().catch(() => null);
+
+  if (!response.ok) {
+    throw new Error(payload?.message || 'Failed to delete project file.');
+  }
+
+  return payload;
+}
+
+function mapApiProjectThreadMessageToReply(
+  message: ApiProjectThreadMessage,
+  currentUserId = '',
+): DiscussionReply {
+  const authorName =
+    getNonEmptyString(message.author?.fullName) ??
+    getNonEmptyString(message.author?.name) ??
+    (message.authorId ? `User ${message.authorId.slice(-4)}` : 'User');
+  const authorInitials =
+    authorName !== 'User'
+      ? getInitials(authorName)
+      : message.authorId
+        ? message.authorId.slice(-2).toUpperCase()
+        : 'US';
+
+  return {
+    id: message.id,
+    authorId: message.createdBy ?? message.authorId,
+    mentionedUserIds: Array.isArray(message.mentionedUserIds)
+      ? message.mentionedUserIds.filter(
+          (mentionedUserId): mentionedUserId is string =>
+            typeof mentionedUserId === 'string' &&
+            mentionedUserId.trim().length > 0,
+        )
+      : [],
+    replyCount: normalizeReplyCount(message.replyCount),
+    reactions: mapApiProjectThreadReactions(
+      message.reactions ?? message.parentReactions,
+      currentUserId,
+    ),
+    author: {
+      name: authorName,
+      initials: authorInitials,
+    },
+    createdAt: formatThreadDate(message.createdAt),
+    updatedAt: getNonEmptyString(message.updatedAt) ?? undefined,
+    isEdited: Boolean(
+      message.updatedAt &&
+        Math.floor(new Date(message.updatedAt).getTime() / 1000) >
+          Math.floor(new Date(message.createdAt).getTime() / 1000),
+    ),
+    message: message.message?.trim() ?? '',
+    attachments: Array.isArray(message.attachments)
+      ? message.attachments.map(mapApiDiscussionAttachment)
+      : [],
+  };
+}
+
+function isApiProjectThreadResponse(
+  payload:
+    | ApiProjectThreadResponse
+    | ApiProjectThreadMessage[]
+    | { message?: string }
+    | null,
+): payload is ApiProjectThreadResponse & {
+  threads: ApiProjectThreadMessage[];
+} {
+  return Boolean(
+    payload &&
+      typeof payload === 'object' &&
+      !Array.isArray(payload) &&
+      Array.isArray((payload as ApiProjectThreadResponse).threads),
+  );
+}
+
+function mapApiProjectThreadReactions(
+  reactions: ApiProjectThreadReaction[] | null | undefined,
+  currentUserId = '',
+): DiscussionReaction[] {
+  if (!Array.isArray(reactions)) {
+    return [];
+  }
+
+  return reactions.flatMap((reaction) => {
+    const emoji = reaction.emoji?.trim();
+
+    if (!emoji) {
+      return [];
+    }
+
+    const countValue = Number(reaction.count ?? 0);
+    const reactedByCurrentUserFromActors = Array.isArray(reaction.actors)
+      ? reaction.actors.some((actor) => actor.id?.trim() === currentUserId)
+      : false;
+
+    return [
+      {
+        emoji,
+        count: Number.isFinite(countValue) && countValue > 0 ? countValue : 1,
+        reactedByCurrentUser: Boolean(
+          reactedByCurrentUserFromActors ||
+            (reaction.reactedByCurrentUser ??
+              reaction.isCurrentUser ??
+              reaction.userReacted),
+        ),
+        actors: Array.isArray(reaction.actors)
+          ? reaction.actors.map((actor) => ({
+              id: actor.id?.trim() || undefined,
+              name: actor.fullName?.trim() || actor.name?.trim() || undefined,
+              isCurrentUser: actor.id?.trim() === currentUserId,
+            }))
+          : undefined,
+      },
+    ];
+  });
+}
+
+function normalizeProjectThreadDetail(
+  payload: unknown,
+  messageId: string,
+  currentUserId: string,
+): ProjectThreadDetail {
+  const normalizedMessages = extractThreadMessages(payload);
+  const mappedReplies = normalizedMessages.map((message) =>
+    mapApiProjectThreadMessageToReply(message, currentUserId),
+  );
+  const header =
+    mappedReplies.find((reply) => reply.id === messageId) ??
+    mappedReplies[0] ??
+    null;
+
+  if (!header) {
+    return {
+      header: null,
+      replies: [],
+    };
+  }
+
+  return {
+    header,
+    replies: mappedReplies.filter((reply) => reply.id !== header.id),
+  };
+}
+
+function extractThreadMessages(payload: unknown): ApiProjectThreadMessage[] {
+  if (Array.isArray(payload)) {
+    return payload.flatMap((item) => extractThreadMessages(item));
+  }
+
+  if (!payload || typeof payload !== 'object') {
+    return [];
+  }
+
+  if ('data' in payload) {
+    return extractThreadMessages((payload as { data?: unknown }).data);
+  }
+
+  const objectPayload = payload as {
+    id?: unknown;
+    parent?: unknown;
+    replies?: unknown;
+    items?: unknown;
+  };
+
+  if (typeof objectPayload.id === 'string') {
+    const currentMessage = payload as ApiProjectThreadMessage;
+    const replyMessages = extractThreadMessages(currentMessage.replies);
+
+    return [currentMessage, ...replyMessages];
+  }
+
+  if (objectPayload.parent || objectPayload.replies) {
+    const parentMessages = objectPayload.parent
+      ? extractThreadMessages([objectPayload.parent])
+      : [];
+    const replyMessages = extractThreadMessages(objectPayload.replies);
+
+    return [...parentMessages, ...replyMessages];
+  }
+
+  if (objectPayload.items) {
+    return extractThreadMessages(objectPayload.items);
+  }
+
+  return [];
+}
+
+function mapApiDiscussionAttachment(attachment: ApiDiscussionAttachment) {
+  const name =
+    getNonEmptyString(attachment.originalName) ??
+    getNonEmptyString(attachment.name) ??
+    'Untitled file';
+
+  return {
+    id: getNonEmptyString(attachment.id) ?? `${name}-${attachment.storageKey}`,
+    name,
+    sizeLabel: formatFileSize(attachment.sizeBytes),
+    extension:
+      getNonEmptyString(attachment.extension) ??
+      getNonEmptyString(attachment.mimeType),
+    storageKey: getNonEmptyString(attachment.storageKey),
+  };
+}
+
+function mapApiProjectTicketToRecentTicket(
+  ticket: ApiProjectTicket,
+): RecentTicket {
+  const projectName = getNonEmptyString(ticket.project?.name) ?? 'Project';
+  const statusLabel =
+    getNonEmptyString(ticket.status?.label) ??
+    mapTicketStatus(ticket.statusKey ?? null);
+  const priorityLabel =
+    getNonEmptyString(ticket.priority?.label) ??
+    mapTicketPriority(ticket.priorityKey ?? null);
+  const assigneeName =
+    getNonEmptyString(ticket.assignee?.fullName) ??
+    getNonEmptyString(ticket.assignee?.name) ??
+    (ticket.assigneeId ? `User ${ticket.assigneeId.slice(-4)}` : 'Unassigned');
+
+  return {
+    id: ticket.id,
+    ticketRefNo: ticket.ticketRefNo,
+    title: ticket.title,
+    ticketType: ticket.ticketType ?? null,
+    contact: ticket.contact ?? null,
+
+    project: {
+      id: ticket.project?.id ?? ticket.projectId,
+      initials: getInitials(projectName),
+      name: projectName,
+      brandColor: ticket.project?.brandColor ?? '#ffffff',
+    },
+    status: statusLabel,
+    statusColor: getNonEmptyString(ticket.status?.color),
+    priority: priorityLabel,
+    priorityColor: getNonEmptyString(ticket.priority?.color),
+    assignee: {
+      name: assigneeName,
+      initials: getInitials(assigneeName),
+    },
+    date: formatDateTime(ticket.createdAt),
+    sortDate: ticket.dueDate ?? ticket.createdAt,
+    reporter: {
+      id: ticket.reporter?.id ?? '',
+      email: ticket.reporter?.email ?? '',
+      fullName: ticket.reporter?.fullName ?? 'Unknown',
+    },
+  };
+}
+
+function mapApiProjectFileToProjectFileRecord(
+  file: ApiProjectFile,
+): ProjectFileRecord {
+  const name =
+    getNonEmptyString(file.name) ??
+    getNonEmptyString(file.fileName) ??
+    getNonEmptyString(file.originalName) ??
+    'Untitled file';
+
+  return {
+    id: getNonEmptyString(file.id) ?? `${name}-${file.createdAt ?? Date.now()}`,
+    name,
+    type: mapProjectFileType(
+      file.type ?? file.mimeType ?? file.extension ?? name,
+    ),
+    size: formatFileSize(file.size ?? file.sizeBytes),
+    uploadedBy:
+      getNonEmptyString(file.uploadedBy) ?? getNonEmptyString(file.createdBy),
+    uploadedAt: formatProjectFileDate(file.uploadedAt ?? file.createdAt),
+    storageKey: getNonEmptyString(file.storageKey),
+    extension: getNonEmptyString(file.extension),
+    mimeType: getNonEmptyString(file.mimeType),
+    source: getNonEmptyString(file.source),
+    sourceId: getNonEmptyString(file.sourceId),
+    status: getNonEmptyString(file.status),
+  };
+}
+
+function isApiProjectTicketsResponse(
+  value: unknown,
+): value is ApiProjectTicketsResponse {
+  return Boolean(
+    value &&
+      typeof value === 'object' &&
+      'items' in value &&
+      'meta' in value &&
+      Array.isArray((value as ApiProjectTicketsResponse).items),
+  );
+}
+
+function isApiProjectTicketsKanbanResponse(
+  value: unknown,
+): value is ApiProjectTicketsKanbanResponse {
+  return Boolean(
+    value &&
+      typeof value === 'object' &&
+      (value as ApiProjectTicketsKanbanResponse).items &&
+      !Array.isArray((value as ApiProjectTicketsKanbanResponse).items) &&
+      typeof (value as ApiProjectTicketsKanbanResponse).items === 'object',
+  );
+}
+
+function mapTicketStatus(value: string | null): TicketStatus {
+  const normalizedValue = value?.trim().toLowerCase();
+
+  if (normalizedValue === 'closed') {
+    return 'Closed';
+  }
+
+  if (normalizedValue === 'resolved') {
+    return 'Resolved';
+  }
+
+  if (normalizedValue === 'in progress' || normalizedValue === 'inprogress') {
+    return 'In Progress';
+  }
+
+  return 'Open';
+}
+
+function mapTicketPriority(value: string | null): TicketPriority | null {
+  const normalizedValue = value?.trim().toLowerCase();
+
+  if (!normalizedValue) {
+    return null;
+  }
+
+  if (normalizedValue === 'critical') {
+    return 'Critical';
+  }
+
+  if (normalizedValue === 'high') {
+    return 'High';
+  }
+
+  if (normalizedValue === 'medium') {
+    return 'Medium';
+  }
+
+  if (normalizedValue === 'low') {
+    return 'Low';
+  }
+
+  return null;
+}
+
+function getInitials(value: string) {
+  const words = value.trim().split(/\s+/).filter(Boolean);
+
+  if (!words.length) {
+    return 'NA';
+  }
+
+  return words
+    .slice(0, 2)
+    .map((word) => word[0])
+    .join('')
+    .toUpperCase();
+}
+
+function formatThreadDate(value: string) {
+  const date = new Date(value);
+
+  if (Number.isNaN(date.getTime())) {
+    return value;
+  }
+
+  return new Intl.DateTimeFormat('en-US', {
+    month: 'short',
+    day: 'numeric',
+    year: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+  }).format(date);
+}
+
+function normalizeReplyCount(value?: string | number | null) {
+  if (typeof value === 'number') {
+    return Number.isFinite(value) && value > 0 ? value : 0;
+  }
+
+  if (typeof value === 'string') {
+    const parsedValue = Number.parseInt(value, 10);
+    return Number.isFinite(parsedValue) && parsedValue > 0 ? parsedValue : 0;
+  }
+
+  return 0;
+}
+
+function mapProjectFileType(value: string): ProjectFileRecord['type'] {
+  const normalizedValue = value.trim().toLowerCase();
+
+  if (normalizedValue.includes('pdf') || normalizedValue.endsWith('.pdf')) {
+    return 'pdf';
+  }
+
+  if (
+    normalizedValue.includes('word') ||
+    normalizedValue.includes('docx') ||
+    normalizedValue.endsWith('.doc') ||
+    normalizedValue.endsWith('.docx')
+  ) {
+    return 'docx';
+  }
+
+  return 'file';
+}
+
+function formatFileSize(value: string | number | null | undefined) {
+  if (typeof value === 'string' && value.trim()) {
+    const parsedValue = Number(value);
+
+    if (Number.isNaN(parsedValue)) {
+      return value;
+    }
+
+    return formatBytes(parsedValue);
+  }
+
+  if (typeof value !== 'number' || Number.isNaN(value)) {
+    return undefined;
+  }
+
+  return formatBytes(value);
+}
+
+function formatBytes(value: number) {
+  if (value < 1024) {
+    return `${value} B`;
+  }
+
+  const units = ['KB', 'MB', 'GB'];
+  let size = value / 1024;
+  let unitIndex = 0;
+
+  while (size >= 1024 && unitIndex < units.length - 1) {
+    size /= 1024;
+    unitIndex += 1;
+  }
+
+  return `${size.toFixed(size >= 10 ? 0 : 1)} ${units[unitIndex]}`;
+}
+
+function formatProjectFileDate(value: string | null | undefined) {
+  if (!value) {
+    return undefined;
+  }
+
+  const date = new Date(value);
+
+  if (Number.isNaN(date.getTime())) {
+    return value;
+  }
+
+  return new Intl.DateTimeFormat('en-US', {
+    month: 'short',
+    day: 'numeric',
+    year: 'numeric',
+  }).format(date);
+}
+
+function getNonEmptyString(value: unknown) {
+  return typeof value === 'string' && value.trim() ? value : undefined;
+}

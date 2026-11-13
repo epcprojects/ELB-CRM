@@ -1,0 +1,59 @@
+import { ClockIcon } from '../../../public/icons';
+
+type StatusCardProps = {
+  title: string;
+  count: number | string;
+  icon?: React.ReactNode;
+  color?: string;
+  onClick?: () => void;
+};
+
+export default function StatusCard({
+  title,
+  count,
+  color,
+  icon = color ? (
+    <span
+      className="block h-2.5 w-2.5 rounded-full xl:h-3.5 xl:w-3.5 2xl:h-4 2xl:w-4"
+      style={{ backgroundColor: color }}
+    />
+  ) : (
+    <ClockIcon fill="currentColor" />
+  ),
+  onClick,
+}: StatusCardProps) {
+  const cardClassName = `min-w-0 w-full border border-white/20 shadow-[0_14px_44px_0_rgb(0_0_0/0.25)] py-1 xl:py-2 pl-2 pr-4 rounded-full text-left${
+    onClick
+      ? ' cursor-pointer transition-colors hover:bg-white/10 focus-visible:outline focus-visible:outline-2 focus-visible:outline-white/60'
+      : ''
+  }`;
+
+  const content = (
+    <div className="flex flex-row gap-1 2xl:gap-3 items-center">
+      <div className="bg-white/24 w-6 h-6 xl:w-9 xl:h-9 2xl:w-12 2xl:h-12 shrink-0 rounded-full shadow-[0_0_30px_0_rgb(0_0_0/0.08)] flex items-center justify-center">
+        {icon}
+      </div>
+      <div className="flex min-w-0 flex-row items-center justify-between gap-2 flex-1">
+        <p
+          className="min-w-0 truncate text-xs 2xl:text-base text-white"
+          title={title}
+        >
+          {title}
+        </p>
+        <p className="shrink-0 text-white text-base 2xl:text-2xl font-bold">
+          {count}
+        </p>
+      </div>
+    </div>
+  );
+
+  if (onClick) {
+    return (
+      <button type="button" onClick={onClick} className={cardClassName}>
+        {content}
+      </button>
+    );
+  }
+
+  return <div className={cardClassName}>{content}</div>;
+}

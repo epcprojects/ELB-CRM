@@ -1,0 +1,4950 @@
+'use client';
+
+import {
+  Menu,
+  MenuButton,
+  MenuItem,
+  MenuItems,
+  Popover,
+  PopoverButton,
+  PopoverPanel,
+  Tab,
+  TabGroup,
+  TabList,
+  TabPanel,
+  TabPanels,
+} from '@headlessui/react';
+
+import {
+  InfiniteData,
+  useMutation,
+  useQueries,
+  useQuery,
+  useQueryClient,
+} from '@tanstack/react-query';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useDebouncedValue } from '../../../../components/hooks/useDebouncedValue';
+import {
+  useParams,
+  usePathname,
+  useRouter,
+  useSearchParams,
+} from 'next/navigation';
+import clsx from 'clsx';
+import CreateTicketModal, {
+  type CreateTicketFormValues,
+} from '../../../../components/modals/CreateTicketModal';
+import UploadFileModal, {
+  type UploadFileFormValues,
+} from '../../../../components/modals/UploadFileModal';
+import { uploadFilesDirectly } from '../../../../lib/attachments';
+import ConfirmActionModal from '../../../../components/modals/ConfirmActionModal';
+import MoveTicketModal from '../../../../components/modals/MoveTicketModal';
+import { useMoveTicketProjectMutation } from '../../../../components/hooks/useMoveTicketProjectMutation';
+import ProjectThreadPanel from '../../../../components/discussion/ProjectThreadPanel';
+import type {
+  DiscussionAttachment,
+  DiscussionReaction,
+  DiscussionReply,
+} from '../../../../components/discussion/types';
+import ProjectFilesPanel, {
+  type ProjectFileRecord,
+} from '../../../../components/projects/ProjectFilesPanel';
+import RichTextEditor from '../../../../components/RichTextEditor';
+import { createTicketProjectOptions } from '../../../../components/modals/create-ticket-modal.data';
+import RecentTicketsTable, {
+  type RecentTicket,
+} from '../../../../components/tables/RecentTicketsTable';
+import TicketsKanbanView, {
+  TicketsKanbanSkeleton,
+} from '../../../../components/tickets/TicketsKanbanView';
+import { appToast } from '../../../../components/toast/AppToast';
+import {
+  CalendarTabIcon,
+  CloseIcon,
+  EditIcon,
+  FilesTabIcon,
+  FiltersIcon,
+  KanbanViewIcon,
+  NotesTabIcon,
+  PlusIcon,
+  SearchIcon,
+  TableViewIcon,
+  ThreadIcon,
+  ThreedotIcon,
+  TicketsIcon,
+  TrashIcon,
+} from '../../../../../public/icons';
+import Dropdown from '../../../../components/ui/ThemeDropDown';
+import ThemeButton from '../../../../components/ui/ThemeButton';
+import ThemeInput from '../../../../components/ui/ThemeInput';
+import { useIsMobile } from '../../../../components/hooks/useIsMobile';
+import { useThread } from '../../../../components/hooks/useThread';
+import { useAppLoader } from '../../../providers/AppLoaderProvider';
+import {
+  createTicket,
+  fetchProjectTicketAssignees,
+  fetchProjectTicketReporters,
+  replaceInlineAttachmentUrls,
+} from '../../../../lib/tickets';
+import {
+  projectsQueryKey,
+  projectTicketsQueryKey,
+  projectThreadQueryKey,
+  projectThreadDetailQueryKey,
+  type ProjectThreadPage,
+  type ProjectNoteRecord,
+  flattenProjectThreadPages,
+  useCreateProjectNoteMutation,
+  useDeleteProjectNoteMutation,
+  useDeleteProjectFileMutation,
+  useDeleteTicketMutation,
+  useProjectDetailQuery,
+  useProjectFilesQuery,
+  useProjectNamesQuery,
+  useProjectNoteDetailQuery,
+  useProjectNotesQuery,
+  useProjectThreadDetailQuery,
+  useProjectThreadInfiniteQuery,
+  useProjectTicketsQuery,
+  useUpdateProjectNoteMutation,
+  useUploadProjectFilesMutation,
+  projectFilesQueryKey,
+  fetchProjectKanbanBoard,
+  fetchProjectKanbanCounts,
+  ProjectKanbanBoardData,
+} from '../projects.queries';
+import {
+  PermissionGuard,
+  usePermissions,
+} from '../../../providers/PermissionProvider';
+import { useAppSelector } from '../../../Redux/store';
+import Calendar from '../../../../components/calendar/Calendar';
+import DashboardSummaryBanner from '../../../../components/ui/DashboardSummaryBanner';
+import EmptyState from '../../../../components/EmptyState';
+import AppModal from '../../../../components/modals/AppModal';
+import { fetchProjectMembers } from '../../../../lib/project-members';
+import { RecentTicketsTableSkeleton } from '../../../../components/tables/RecentTicketsTableSkeleton';
+
+const projectTabs = ['Leads', 'Thread', 'Files', 'Calendar', 'Notes'] as const;
+const projectTabQueryParamMap: Record<
+  (typeof projectTabs)[number],
+  string | null
+> = {
+  Leads: null,
+  Thread: '1',
+  Files: '2',
+  Calendar: '3',
+  Notes: '4',
+};
+const PROJECT_TICKETS_STATUS_QUERY_PARAM = 'ticketStatus';
+const PROJECT_TICKETS_PRIORITY_QUERY_PARAM = 'ticketPriority';
+const PROJECT_TICKETS_PAGE_QUERY_PARAM = 'page';
+const PROJECT_TICKETS_PAGE_SIZE_QUERY_PARAM = 'size';
+const PROJECT_TICKETS_PAGE_SIZE_OPTIONS = [10, 25, 50, 100];
+const PROJECT_TICKETS_VIEW_QUERY_PARAM = 'ticketView';
+const PROJECT_NOTES_LIMIT = 50;
+const MAX_PROJECT_NOTE_DESCRIPTION_LENGTH = 4000;
+const PROJECT_KANBAN_PAGE_SIZE = 20;
+const PROJECT_TICKETS_TYPE_QUERY_PARAM = 'ticketType';
+const PROJECT_TICKETS_CONTACT_QUERY_PARAM = 'contactId';
+const PROJECT_TICKETS_DATE_FROM_QUERY_PARAM = 'dateFrom';
+const PROJECT_TICKETS_DATE_TO_QUERY_PARAM = 'dateTo';
+const PROJECT_TICKETS_CREATED_BY_QUERY_PARAM = 'reporterId';
+const PROJECT_TICKETS_ASSIGNED_TO_QUERY_PARAM = 'assigneeId';
+
+type SocketTokenResponse = {
+  accessToken: string;
+  socketUrl: string;
+};
+type ProjectTicketsCacheData = {
+  items: RecentTicket[];
+  meta: {
+    total: number;
+    page: number;
+    limit: number;
+  };
+};
+
+export default function ProjectDetailPage() {
+  const params = useParams<{ projectId: string }>();
+  const router = useRouter();
+  const pathname = usePathname();
+  const searchParams = useSearchParams();
+  const { setLoading } = useAppLoader();
+  const isMobile = useIsMobile();
+  const currentUserId = useAppSelector((state) => state.auth.user?.id ?? '');
+  const { hasPermission } = usePermissions();
+  const canViewProjectDetail = hasPermission('projects.view_detail');
+  const canViewTickets = hasPermission('tickets.view_list');
+  const canViewTicketDetail = hasPermission('tickets.view_detail');
+  const canCreateTicket = hasPermission('tickets.create');
+  const canDeleteTicket = hasPermission('tickets.delete');
+  const canViewThread = hasPermission('thread.view');
+  const canEditThread = hasPermission('thread.edit');
+  const canViewThreadReplies = hasPermission('thread.view_replies');
+  const canDeleteThread = hasPermission('thread.delete');
+  const canPostThreadMessage = hasPermission('thread.post_message');
+  const canPostThreadReply = hasPermission('thread.post_reply');
+  const canAttachThreadFile = hasPermission('thread.attach_file');
+  const canViewFiles = hasPermission('files.view');
+  const canUploadFiles = hasPermission('files.upload');
+  const canDownloadFiles = hasPermission('files.download');
+  const canViewCalendar = hasPermission('calendar.view_grid');
+  const canViewProjectNotesList = hasPermission('projects_notes.view_list');
+  const canViewProjectNoteDetail = hasPermission('projects_notes.view_detail');
+  const canCreateProjectNote = hasPermission('projects_notes.create');
+  const canEditProjectNote = hasPermission('projects_notes.edit');
+  const canDeleteProjectNote = hasPermission('projects_notes.delete');
+  const canEditTicketStatus = hasPermission('tickets.edit_status');
+  const canChangeTicketProject = hasPermission('tickets.change_project');
+  const [createTicketOpen, setCreateTicketOpen] = useState(false);
+  const [uploadFileOpen, setUploadFileOpen] = useState(false);
+  const [searchValue, setSearchValue] = useState('');
+  const [projectTicketFiltersOpen, setProjectTicketFiltersOpen] =
+    useState(false);
+  const [ticketToDelete, setTicketToDelete] = useState<RecentTicket | null>(
+    null,
+  );
+  const [ticketToMove, setTicketToMove] = useState<RecentTicket | null>(null);
+  const debouncedSearchValue = useDebouncedValue(searchValue);
+  const [fileSearchValue, setFileSearchValue] = useState('');
+  const [notesSearchValue, setNotesSearchValue] = useState('');
+  const debouncedNotesSearchValue = useDebouncedValue(notesSearchValue);
+  const [loadingProjectKanbanStatuses, setLoadingProjectKanbanStatuses] =
+    useState<Record<string, boolean>>({});
+
+  const loadingProjectKanbanStatusesRef = useRef<Record<string, boolean>>({});
+  const [uploadedFilesState, setUploadedFilesState] = useState<
+    ProjectFileRecord[]
+  >([]);
+  const [fileToDelete, setFileToDelete] = useState<ProjectFileRecord | null>(
+    null,
+  );
+  const [selectedThreadMessageId, setSelectedThreadMessageId] = useState('');
+  const [selectedProjectNoteId, setSelectedProjectNoteId] = useState('');
+  const [isProjectNoteMobileModalOpen, setIsProjectNoteMobileModalOpen] =
+    useState(false);
+  const [isCreatingProjectNote, setIsCreatingProjectNote] = useState(false);
+  const [isEditingProjectNote, setIsEditingProjectNote] = useState(false);
+  const [pendingProjectNoteEditId, setPendingProjectNoteEditId] = useState('');
+  const [deletingThreadReplyId, setDeletingThreadReplyId] = useState('');
+  const [editingThreadReplyId, setEditingThreadReplyId] = useState('');
+  const [projectNoteTitleDraft, setProjectNoteTitleDraft] = useState('');
+  const [projectNoteDescriptionDraft, setProjectNoteDescriptionDraft] =
+    useState('');
+  const [projectNoteToDelete, setProjectNoteToDelete] =
+    useState<ProjectNoteRecord | null>(null);
+  const [threadSocketToken, setThreadSocketToken] =
+    useState<SocketTokenResponse | null>(null);
+  const [ticketsPagination, setTicketsPagination] = useState(() => {
+    const requestedPage = Number(
+      searchParams.get(PROJECT_TICKETS_PAGE_QUERY_PARAM),
+    );
+    const requestedPageSize = Number(
+      searchParams.get(PROJECT_TICKETS_PAGE_SIZE_QUERY_PARAM),
+    );
+
+    return {
+      pageIndex:
+        Number.isInteger(requestedPage) && requestedPage > 0
+          ? requestedPage - 1
+          : 0,
+      pageSize: PROJECT_TICKETS_PAGE_SIZE_OPTIONS.includes(requestedPageSize)
+        ? requestedPageSize
+        : 10,
+    };
+  });
+  const handleProjectTicketsPaginationChange = (
+    nextPagination: typeof ticketsPagination,
+  ) => {
+    setTicketsPagination(nextPagination);
+
+    const nextSearchParams = new URLSearchParams(searchParams.toString());
+
+    nextSearchParams.set(
+      PROJECT_TICKETS_PAGE_QUERY_PARAM,
+      String(nextPagination.pageIndex + 1),
+    );
+    nextSearchParams.set(
+      PROJECT_TICKETS_PAGE_SIZE_QUERY_PARAM,
+      String(nextPagination.pageSize),
+    );
+
+    const nextQueryString = nextSearchParams.toString();
+
+    router.replace(
+      nextQueryString ? `${pathname}?${nextQueryString}` : pathname,
+      {
+        scroll: false,
+      },
+    );
+  };
+  const projectId = String(params?.projectId ?? '');
+
+  useEffect(() => {
+    const requestedPage = Number(
+      searchParams.get(PROJECT_TICKETS_PAGE_QUERY_PARAM),
+    );
+    const requestedPageSize = Number(
+      searchParams.get(PROJECT_TICKETS_PAGE_SIZE_QUERY_PARAM),
+    );
+    const nextPageIndex =
+      Number.isInteger(requestedPage) && requestedPage > 0
+        ? requestedPage - 1
+        : 0;
+    const nextPageSize = PROJECT_TICKETS_PAGE_SIZE_OPTIONS.includes(
+      requestedPageSize,
+    )
+      ? requestedPageSize
+      : 10;
+
+    setTicketsPagination((current) =>
+      current.pageIndex === nextPageIndex && current.pageSize === nextPageSize
+        ? current
+        : { pageIndex: nextPageIndex, pageSize: nextPageSize },
+    );
+  }, [searchParams]);
+
+  const handleProjectTicketSearchChange = (value: string) => {
+    setSearchValue(value);
+
+    if (ticketsPagination.pageIndex === 0) return;
+
+    setTicketsPagination((current) => ({ ...current, pageIndex: 0 }));
+
+    const nextSearchParams = new URLSearchParams(searchParams.toString());
+
+    nextSearchParams.set(PROJECT_TICKETS_PAGE_QUERY_PARAM, '1');
+    router.replace(`${pathname}?${nextSearchParams.toString()}`, {
+      scroll: false,
+    });
+  };
+
+  const selectedStatus = getDashboardStatusFilterValue(
+    searchParams.get(PROJECT_TICKETS_STATUS_QUERY_PARAM),
+  );
+  const selectedPriority = getProjectTicketFilterValue(
+    searchParams.get(PROJECT_TICKETS_PRIORITY_QUERY_PARAM),
+  );
+  const selectedTicketType = getProjectTicketTypeFilterValue(
+    searchParams.get(PROJECT_TICKETS_TYPE_QUERY_PARAM),
+  );
+  const selectedContactId = getProjectTicketFilterValue(
+    searchParams.get(PROJECT_TICKETS_CONTACT_QUERY_PARAM),
+  );
+  const dateFromValue =
+    searchParams.get(PROJECT_TICKETS_DATE_FROM_QUERY_PARAM) ?? '';
+  const dateToValue =
+    searchParams.get(PROJECT_TICKETS_DATE_TO_QUERY_PARAM) ?? '';
+  const selectedCreatedBy = getProjectTicketFilterValue(
+    searchParams.get(PROJECT_TICKETS_CREATED_BY_QUERY_PARAM),
+  );
+  const selectedAssignedTo = getProjectTicketFilterValue(
+    searchParams.get(PROJECT_TICKETS_ASSIGNED_TO_QUERY_PARAM),
+  );
+
+  const projectTicketsViewMode =
+    searchParams.get(PROJECT_TICKETS_VIEW_QUERY_PARAM) === 'kanban'
+      ? 'kanban'
+      : 'table';
+  const hasShownError = useRef(false);
+  const queryClient = useQueryClient();
+  const updateProjectThreadReplyCount = (
+    threadId: string,
+    updateCount: (currentCount: number) => number,
+  ) => {
+    queryClient.setQueryData<InfiniteData<ProjectThreadPage>>(
+      [...projectThreadQueryKey, projectId, currentUserId],
+      (currentReplies) =>
+        currentReplies
+          ? {
+              ...currentReplies,
+              pages: currentReplies.pages.map((page) => ({
+                ...page,
+                threads: page.threads.map((reply) =>
+                  reply.id === threadId
+                    ? {
+                        ...reply,
+                        replyCount: Math.max(
+                          0,
+                          updateCount(reply.replyCount ?? 0),
+                        ),
+                      }
+                    : reply,
+                ),
+              })),
+            }
+          : currentReplies,
+    );
+  };
+  const projectDetailQuery = useProjectDetailQuery(
+    projectId,
+    canViewProjectDetail,
+  );
+  const shouldRedirectToNotFound =
+    projectDetailQuery.isError && isNotFoundError(projectDetailQuery.error);
+  const projectThreadQuery = useProjectThreadInfiniteQuery(
+    projectId,
+    currentUserId,
+    canViewThread,
+  );
+  const projectThreadDetailQuery = useProjectThreadDetailQuery(
+    projectId,
+    selectedThreadMessageId,
+    currentUserId,
+    canViewThread,
+  );
+  const projectMembersQuery = useQuery({
+    queryKey: ['project-members', projectId],
+    queryFn: () => fetchProjectMembers(projectId),
+    enabled: Boolean(
+      projectId &&
+        (canPostThreadMessage || canPostThreadReply || canViewTickets),
+    ),
+  });
+
+  const projectTicketReportersQuery = useQuery({
+    queryKey: ['ticket-reporters', projectId],
+    queryFn: () => fetchProjectTicketReporters(projectId),
+    enabled: Boolean(projectId && canViewTickets),
+  });
+
+  const projectTicketAssigneesQuery = useQuery({
+    queryKey: ['ticket-assignees', projectId],
+    queryFn: () => fetchProjectTicketAssignees(projectId),
+    enabled: Boolean(projectId && canViewTickets),
+  });
+
+  const projectFilesQuery = useProjectFilesQuery(projectId, canViewFiles);
+  const createProjectNoteMutation = useCreateProjectNoteMutation();
+  const updateProjectNoteMutation = useUpdateProjectNoteMutation();
+  const deleteProjectNoteMutation = useDeleteProjectNoteMutation();
+  const deleteTicketMutation = useDeleteTicketMutation();
+  const moveTicketProjectMutation = useMoveTicketProjectMutation();
+  const projectNotesQuery = useProjectNotesQuery(
+    projectId,
+    {
+      page: 1,
+      limit: PROJECT_NOTES_LIMIT,
+      search: debouncedNotesSearchValue.trim() || undefined,
+    },
+    canViewProjectNotesList,
+  );
+  const projectNoteDetailQuery = useProjectNoteDetailQuery(
+    projectId,
+    selectedProjectNoteId,
+    canViewProjectNoteDetail && !isCreatingProjectNote,
+  );
+  const projectTicketsQuery = useProjectTicketsQuery(
+    projectId,
+    {
+      page: ticketsPagination.pageIndex + 1,
+      limit: ticketsPagination.pageSize,
+      search: debouncedSearchValue.trim() || undefined,
+      statusKey: selectedStatus === 'all' ? undefined : selectedStatus,
+      priorityKey: selectedPriority === 'all' ? undefined : selectedPriority,
+      ticketType: selectedTicketType === 'all' ? undefined : selectedTicketType,
+      contactId: selectedContactId === 'all' ? undefined : selectedContactId,
+      dateFrom: dateFromValue || undefined,
+      dateTo: dateToValue || undefined,
+      reporterId: selectedCreatedBy === 'all' ? undefined : selectedCreatedBy,
+      assigneeId: selectedAssignedTo === 'all' ? undefined : selectedAssignedTo,
+    },
+    canViewTickets && projectTicketsViewMode === 'table',
+  );
+  const projectKanbanPriorityKey =
+    selectedPriority === 'all' ? undefined : selectedPriority;
+
+  const projectKanbanTicketType =
+    selectedTicketType === 'all' ? undefined : selectedTicketType;
+
+  const projectKanbanSearch = debouncedSearchValue.trim() || undefined;
+
+  const projectKanbanPeopleFilters = {
+    contactId: selectedContactId === 'all' ? undefined : selectedContactId,
+    reporterId: selectedCreatedBy === 'all' ? undefined : selectedCreatedBy,
+    assigneeId: selectedAssignedTo === 'all' ? undefined : selectedAssignedTo,
+  };
+
+  const projectKanbanBoardQueryKey = [
+    'project-kanban-board',
+    projectId,
+    projectKanbanPriorityKey ?? 'all',
+    projectKanbanTicketType ?? 'all',
+    projectKanbanSearch ?? '',
+    selectedContactId,
+    selectedCreatedBy,
+    selectedAssignedTo,
+  ] as const;
+
+  const projectKanbanBoardQuery = useQuery({
+    queryKey: projectKanbanBoardQueryKey,
+    queryFn: () =>
+      fetchProjectKanbanBoard({
+        projectId,
+        priorityKey: projectKanbanPriorityKey,
+        ticketType: projectKanbanTicketType,
+        search: projectKanbanSearch,
+        ...projectKanbanPeopleFilters,
+        limit: PROJECT_KANBAN_PAGE_SIZE,
+      }),
+    enabled:
+      Boolean(projectId) &&
+      canViewTickets &&
+      projectTicketsViewMode === 'kanban',
+  });
+
+  const projectKanbanCountsQuery = useQuery({
+    queryKey: [
+      'project-kanban-counts',
+      projectId,
+      projectKanbanPriorityKey ?? 'all',
+      projectKanbanTicketType ?? 'all',
+      projectKanbanSearch ?? '',
+      selectedContactId,
+      selectedCreatedBy,
+      selectedAssignedTo,
+    ],
+    queryFn: () =>
+      fetchProjectKanbanCounts({
+        projectId,
+        priorityKey: projectKanbanPriorityKey,
+        ticketType: projectKanbanTicketType,
+        search: projectKanbanSearch,
+        ...projectKanbanPeopleFilters,
+      }),
+    enabled:
+      Boolean(projectId) &&
+      canViewTickets &&
+      projectTicketsViewMode === 'kanban',
+  });
+  const projectKanbanTickets = useMemo(
+    () => Object.values(projectKanbanBoardQuery.data?.items ?? {}).flat(),
+    [projectKanbanBoardQuery.data?.items],
+  );
+  const handleLoadMoreProjectKanbanStatus = async (statusKey: string) => {
+    const currentBoard = queryClient.getQueryData<ProjectKanbanBoardData>(
+      projectKanbanBoardQueryKey,
+    );
+
+    if (!currentBoard) {
+      return;
+    }
+
+    const existingTickets = currentBoard.items[statusKey] ?? [];
+
+    const loadedCount = existingTickets.length;
+
+    const totalCount = projectKanbanCountsQuery.data?.[statusKey] ?? 0;
+
+    const backendHasMore =
+      currentBoard.hasMore[statusKey] ?? loadedCount < totalCount;
+
+    if (
+      loadedCount >= totalCount ||
+      !backendHasMore ||
+      loadingProjectKanbanStatusesRef.current[statusKey]
+    ) {
+      return;
+    }
+
+    loadingProjectKanbanStatusesRef.current[statusKey] = true;
+
+    const nextPage = (currentBoard.pageByStatus[statusKey] ?? 1) + 1;
+
+    setLoadingProjectKanbanStatuses((current) => ({
+      ...current,
+      [statusKey]: true,
+    }));
+
+    try {
+      const nextPageData = await queryClient.fetchQuery({
+        queryKey: [
+          'project-kanban-board-page',
+          projectId,
+          statusKey,
+          nextPage,
+          PROJECT_KANBAN_PAGE_SIZE,
+          projectKanbanPriorityKey ?? 'all',
+          projectKanbanTicketType ?? 'all',
+          projectKanbanSearch ?? '',
+          selectedContactId,
+          selectedCreatedBy,
+          selectedAssignedTo,
+        ],
+        queryFn: () =>
+          fetchProjectKanbanBoard({
+            projectId,
+            statusKey,
+            page: nextPage,
+            limit: PROJECT_KANBAN_PAGE_SIZE,
+            priorityKey: projectKanbanPriorityKey,
+            ticketType: projectKanbanTicketType,
+            search: projectKanbanSearch,
+            ...projectKanbanPeopleFilters,
+          }),
+      });
+
+      queryClient.setQueryData<ProjectKanbanBoardData>(
+        projectKanbanBoardQueryKey,
+        (current) => {
+          if (!current) {
+            return current;
+          }
+
+          const currentTickets = current.items[statusKey] ?? [];
+
+          const targetStatus = statusMetadataByKey.get(statusKey);
+
+          const incomingTickets = (nextPageData.items[statusKey] ?? []).map(
+            (ticket) => ({
+              ...ticket,
+              status: targetStatus?.label ?? ticket.status ?? statusKey,
+              statusColor: targetStatus?.color ?? ticket.statusColor,
+            }),
+          );
+
+          const existingIds = new Set(
+            currentTickets.map((ticket) => ticket.id).filter(Boolean),
+          );
+
+          const uniqueIncomingTickets = incomingTickets.filter((ticket) => {
+            if (!ticket.id || existingIds.has(ticket.id)) {
+              return false;
+            }
+
+            existingIds.add(ticket.id);
+            return true;
+          });
+
+          const nextLoadedCount =
+            currentTickets.length + uniqueIncomingTickets.length;
+
+          const statusTotalCount =
+            projectKanbanCountsQuery.data?.[statusKey] ?? 0;
+
+          const responseHasMore = nextPageData.hasMore[statusKey] ?? false;
+
+          const shouldLoadMore =
+            uniqueIncomingTickets.length > 0 &&
+            nextLoadedCount < statusTotalCount &&
+            responseHasMore;
+
+          return {
+            ...current,
+            items: {
+              ...current.items,
+              [statusKey]: [...currentTickets, ...uniqueIncomingTickets],
+            },
+            hasMore: {
+              ...current.hasMore,
+              [statusKey]: shouldLoadMore,
+            },
+            pageByStatus: {
+              ...current.pageByStatus,
+              [statusKey]: nextPage,
+            },
+          };
+        },
+      );
+    } catch (error) {
+      appToast.error(
+        error instanceof Error
+          ? error.message
+          : 'Failed to load more project leads.',
+      );
+    } finally {
+      loadingProjectKanbanStatusesRef.current[statusKey] = false;
+
+      setLoadingProjectKanbanStatuses((current) => ({
+        ...current,
+        [statusKey]: false,
+      }));
+    }
+  };
+  const uploadProjectFilesMutation = useUploadProjectFilesMutation();
+  const deleteProjectFileMutation = useDeleteProjectFileMutation();
+  const toggleProjectThreadReactionMutation = useMutation({
+    mutationFn: async ({
+      messageId,
+      emoji,
+      remove,
+    }: {
+      messageId: string;
+      emoji: string;
+      remove: boolean;
+    }) => {
+      const response = await fetch(
+        `/api/projects/${projectId}/thread/${messageId}/reactions`,
+        {
+          method: remove ? 'DELETE' : 'POST',
+          headers: {
+            Accept: 'application/json',
+            ...(remove ? {} : { 'Content-Type': 'application/json' }),
+          },
+          ...(remove ? {} : { body: JSON.stringify({ emoji }) }),
+        },
+      );
+
+      const data = await response.json().catch(() => null);
+
+      if (!response.ok) {
+        const message =
+          Array.isArray(data?.message) && data.message.length
+            ? data.message.join(', ')
+            : data?.message || 'Failed to update thread reaction.';
+        throw new Error(message);
+      }
+
+      return data;
+    },
+    onError: (error) => {
+      appToast.error(
+        error instanceof Error
+          ? error.message
+          : 'Failed to update thread reaction.',
+      );
+    },
+  });
+  const projectsQuery = useProjectNamesQuery(
+    canCreateTicket || canChangeTicketProject,
+  );
+  const ticketStatusesQuery = useQuery({
+    queryKey: ['ticket-statuses'],
+    queryFn: fetchTicketStatuses,
+    enabled: canViewTickets,
+  });
+  const ticketPrioritiesQuery = useQuery({
+    queryKey: ['ticket-priorities'],
+    queryFn: fetchTicketPriorities,
+    enabled: canViewTickets,
+  });
+  const ticketContactsQuery = useQuery({
+    queryKey: ['contacts', 'ticket-filter'],
+    queryFn: fetchTicketContactOptions,
+    enabled: canViewTickets,
+  });
+
+  const statusFilterOptions = useMemo(
+    () => [
+      {
+        label: 'All Status',
+        value: 'all',
+      },
+      {
+        label: 'Active',
+        value: 'Active',
+      },
+      ...(ticketStatusesQuery.data ?? []).map(mapTicketSettingToDropdownOption),
+    ],
+    [ticketStatusesQuery.data],
+  );
+  const kanbanStatusOptions = useMemo(
+    () =>
+      (ticketStatusesQuery.data ?? []).map((status) => ({
+        id: status.id,
+        label: status.label,
+        value: status.key,
+        color: status.color,
+      })),
+    [ticketStatusesQuery.data],
+  );
+  const statusMetadataByKey = useMemo(
+    () =>
+      new Map(
+        (ticketStatusesQuery.data ?? []).map((status) => [
+          status.key,
+          {
+            label: status.label,
+            color: status.color,
+          },
+        ]),
+      ),
+    [ticketStatusesQuery.data],
+  );
+  const moveProjectTicketMutation = useMutation({
+    mutationFn: async ({
+      ticket,
+      statusKey,
+    }: {
+      ticket: RecentTicket;
+      statusKey: string;
+    }) => {
+      const response = await fetch(
+        `/api/projects/${projectId}/tickets/${ticket.id}`,
+        {
+          method: 'PATCH',
+          headers: {
+            'Content-Type': 'application/json',
+            Accept: 'application/json',
+          },
+          body: JSON.stringify({
+            statusKey,
+          }),
+        },
+      );
+
+      const data = await response.json().catch(() => null);
+
+      if (!response.ok) {
+        const message =
+          Array.isArray(data?.message) && data.message.length
+            ? data.message.join(', ')
+            : data?.message || 'Failed to update lead status.';
+
+        throw new Error(message);
+      }
+
+      return {
+        ticket,
+        statusKey,
+      };
+    },
+
+    onMutate: async ({ ticket, statusKey }) => {
+      const projectTicketsKey = [...projectTicketsQueryKey, projectId];
+
+      const nextStatus = statusMetadataByKey.get(statusKey);
+
+      await queryClient.cancelQueries({
+        queryKey: projectTicketsKey,
+      });
+
+      const previousQueries =
+        queryClient.getQueriesData<ProjectTicketsCacheData>({
+          queryKey: projectTicketsKey,
+        });
+
+      queryClient.setQueriesData<ProjectTicketsCacheData>(
+        {
+          queryKey: projectTicketsKey,
+        },
+        (current) => {
+          if (!current) {
+            return current;
+          }
+
+          return {
+            ...current,
+            items: current.items.map((currentTicket) =>
+              currentTicket.id === ticket.id
+                ? {
+                    ...currentTicket,
+                    status: nextStatus?.label ?? currentTicket.status,
+                    statusColor: nextStatus?.color ?? currentTicket.statusColor,
+                  }
+                : currentTicket,
+            ),
+          };
+        },
+      );
+
+      return {
+        previousQueries,
+      };
+    },
+
+    onError: (error, _variables, context) => {
+      context?.previousQueries.forEach(([queryKey, data]) => {
+        queryClient.setQueryData(queryKey, data);
+      });
+
+      appToast.error(
+        error instanceof Error
+          ? error.message
+          : 'Failed to update lead status.',
+      );
+    },
+
+    onSuccess: () => {
+      appToast.success('Lead status updated successfully.');
+    },
+
+    onSettled: async () => {
+      await Promise.all([
+        queryClient.invalidateQueries({
+          queryKey: [...projectTicketsQueryKey, projectId],
+        }),
+
+        queryClient.invalidateQueries({
+          queryKey: ['dashboard-project-tickets'],
+          refetchType: 'all',
+        }),
+        queryClient.invalidateQueries({
+          queryKey: ['project-kanban-board', projectId],
+        }),
+
+        queryClient.invalidateQueries({
+          queryKey: ['project-kanban-counts', projectId],
+        }),
+
+        queryClient.invalidateQueries({
+          queryKey: [...projectTicketsQueryKey, projectId],
+        }),
+
+        queryClient.invalidateQueries({
+          queryKey: ['dashboard', 'recent-tickets'],
+          refetchType: 'all',
+        }),
+
+        queryClient.invalidateQueries({
+          queryKey: ['dashboard', 'upcoming'],
+          refetchType: 'all',
+        }),
+
+        queryClient.invalidateQueries({
+          queryKey: ['dashboard', 'critical-tickets'],
+          refetchType: 'all',
+        }),
+
+        queryClient.invalidateQueries({
+          queryKey: ['dashboard', 'ticket-summary'],
+          refetchType: 'all',
+        }),
+      ]);
+    },
+  });
+  const handleMoveProjectTicket = async (
+    ticket: RecentTicket,
+    nextStatusKey: string,
+  ) => {
+    if (!canEditTicketStatus || moveProjectTicketMutation.isPending) {
+      return;
+    }
+
+    const nextStatus = statusMetadataByKey.get(nextStatusKey);
+
+    if (!nextStatus || ticket.status === nextStatus.label) {
+      return;
+    }
+
+    await moveProjectTicketMutation.mutateAsync({
+      ticket,
+      statusKey: nextStatusKey,
+    });
+  };
+  const reorderProjectStatusMutation = useMutation({
+    mutationFn: async ({
+      statusId,
+      newIndex,
+    }: {
+      statusId: string;
+      newIndex: number;
+    }) => {
+      const response = await fetch('/api/ticket-statuses/reorder', {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+        },
+        body: JSON.stringify({
+          statusId,
+          newIndex,
+        }),
+      });
+
+      const data = await response.json().catch(() => null);
+
+      if (!response.ok) {
+        throw new Error(data?.message || 'Failed to reorder lead statuses.');
+      }
+
+      return {
+        statusId,
+        newIndex,
+      };
+    },
+
+    onMutate: async ({ statusId, newIndex }) => {
+      await queryClient.cancelQueries({
+        queryKey: ['ticket-statuses'],
+      });
+
+      const previousStatuses = queryClient.getQueryData<ApiTicketSetting[]>([
+        'ticket-statuses',
+      ]);
+
+      queryClient.setQueryData<ApiTicketSetting[]>(
+        ['ticket-statuses'],
+        (current) => {
+          if (!current) {
+            return current;
+          }
+
+          const draggedIndex = current.findIndex(
+            (status) => status.id === statusId,
+          );
+
+          if (draggedIndex === -1) {
+            return current;
+          }
+
+          const nextOrder = [...current];
+          const [draggedStatus] = nextOrder.splice(draggedIndex, 1);
+
+          if (!draggedStatus) {
+            return current;
+          }
+
+          nextOrder.splice(newIndex, 0, draggedStatus);
+
+          return nextOrder;
+        },
+      );
+
+      return {
+        previousStatuses,
+      };
+    },
+
+    onError: (error, _variables, context) => {
+      if (context?.previousStatuses) {
+        queryClient.setQueryData(['ticket-statuses'], context.previousStatuses);
+      }
+
+      appToast.error(
+        error instanceof Error
+          ? error.message
+          : 'Failed to reorder lead statuses.',
+      );
+    },
+
+    onSuccess: () => {
+      appToast.success('Lead statuses reordered successfully.');
+    },
+
+    onSettled: async () => {
+      await queryClient.invalidateQueries({
+        queryKey: ['ticket-statuses'],
+      });
+    },
+  });
+  const handleReorderProjectStatusColumn = (
+    statusId: string,
+    newIndex: number,
+  ) => {
+    if (reorderProjectStatusMutation.isPending) {
+      return;
+    }
+
+    reorderProjectStatusMutation.mutate({
+      statusId,
+      newIndex,
+    });
+  };
+  const priorityFilterOptions = useMemo(
+    () => [
+      {
+        label: 'All Priority',
+        value: 'all',
+      },
+      ...(ticketPrioritiesQuery.data ?? []).map(
+        mapTicketSettingToDropdownOption,
+      ),
+    ],
+    [ticketPrioritiesQuery.data],
+  );
+  const contactFilterOptions = useMemo(
+    () => [
+      { label: 'All Contacts', value: 'all' },
+      ...(ticketContactsQuery.data ?? []).map((contact) => ({
+        label: contact.fullName
+          ? `${contact.fullName} (${contact.phone})`
+          : contact.phone,
+        value: contact.id,
+      })),
+    ],
+    [ticketContactsQuery.data],
+  );
+  const createdByFilterOptions = useMemo(
+    () => [
+      { label: 'All Creators', value: 'all' },
+      ...(projectTicketReportersQuery.data ?? []).map((reporter) => ({
+        label: reporter.fullName,
+        value: reporter.id,
+      })),
+    ],
+    [projectTicketReportersQuery.data],
+  );
+  // "View Only Assigned To Me" users only ever see their own leads, so an
+  // "Unassigned" agent option would always come back empty for them.
+  const isAssignedOnlyViewer =
+    !hasPermission('tickets.view_all_leads') &&
+    hasPermission('tickets.view_only_assigned_to_me');
+  const assignedToFilterOptions = useMemo(
+    () => [
+      ...(isAssignedOnlyViewer
+        ? []
+        : [{ label: 'Unassigned', value: 'unassigned' }]),
+      ...(projectTicketAssigneesQuery.data ?? []).map((assignee) => ({
+        label: assignee.fullName,
+        value: assignee.id,
+      })),
+    ],
+    [projectTicketAssigneesQuery.data, isAssignedOnlyViewer],
+  );
+
+  const project = projectDetailQuery.data;
+
+  const createProjectThreadMutation = useMutation({
+    mutationFn: async ({
+      message,
+      attachments,
+      inlineAttachments,
+      parentId,
+      mentionedUserIds,
+    }: {
+      message: string;
+      attachments: File[];
+      inlineAttachments: File[];
+      parentId?: string;
+      mentionedUserIds?: string[];
+    }) => {
+      const filesToUpload = [...attachments, ...inlineAttachments];
+      const uploadedFiles = filesToUpload.length
+        ? await uploadFilesDirectly(
+            filesToUpload,
+            `projects/${projectId}/threads`,
+          )
+        : [];
+      const uploadedAttachments = uploadedFiles.slice(0, attachments.length);
+      const uploadedInlineAttachments = uploadedFiles.slice(attachments.length);
+      const storedMessage = replaceInlineAttachmentUrls(
+        message.trim(),
+        inlineAttachments,
+        uploadedInlineAttachments,
+      );
+
+      const response = await fetch(`/api/projects/${projectId}/thread`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          message: storedMessage,
+          parentId: parentId?.trim(),
+          mentionedUserIds,
+          attachments: uploadedAttachments,
+        }),
+      });
+
+      const data = await response.json().catch(() => null);
+
+      if (!response.ok) {
+        const message =
+          Array.isArray(data?.message) && data.message.length
+            ? data.message.join(', ')
+            : data?.message || 'Failed to post project thread message.';
+        throw new Error(message);
+      }
+
+      return data;
+    },
+    onSuccess: async (_data, variables) => {
+      if (variables.parentId) {
+        updateProjectThreadReplyCount(
+          variables.parentId,
+          (currentCount) => currentCount + 1,
+        );
+      }
+
+      const invalidations: Promise<unknown>[] = [
+        queryClient.invalidateQueries({
+          queryKey: [...projectThreadQueryKey, projectId],
+        }),
+      ];
+
+      if (variables.parentId) {
+        invalidations.push(
+          queryClient.invalidateQueries({
+            queryKey: [
+              ...projectThreadDetailQueryKey,
+              projectId,
+              variables.parentId,
+            ],
+          }),
+        );
+      }
+
+      if (variables.attachments.length > 0) {
+        invalidations.push(
+          queryClient.invalidateQueries({
+            queryKey: [...projectFilesQueryKey, projectId],
+          }),
+        );
+      }
+
+      await Promise.all(invalidations);
+
+      appToast.success(
+        variables.parentId
+          ? 'Reply posted successfully.'
+          : 'Thread posted successfully.',
+      );
+    },
+    onError: (error) => {
+      appToast.error(
+        error instanceof Error
+          ? error.message
+          : 'Failed to post project thread message.',
+      );
+    },
+  });
+
+  const updateProjectThreadMutation = useMutation({
+    mutationFn: async ({
+      messageId,
+      message,
+      parentId,
+      mentionedUserIds,
+    }: {
+      messageId: string;
+      message: string;
+      parentId?: string;
+      mentionedUserIds: string[];
+    }) => {
+      const response = await fetch(
+        `/api/projects/${projectId}/thread/${messageId}`,
+        {
+          method: 'PUT',
+          headers: {
+            'Content-Type': 'application/json',
+            Accept: 'application/json',
+          },
+          body: JSON.stringify({
+            message: message.trim(),
+            parentId: parentId?.trim() || undefined,
+            mentionedUserIds: mentionedUserIds
+              .map((mentionedUserId) => mentionedUserId.trim())
+              .filter((mentionedUserId) => mentionedUserId.length > 0),
+          }),
+        },
+      );
+
+      const data = await response.json().catch(() => null);
+
+      if (!response.ok) {
+        const message =
+          Array.isArray(data?.message) && data.message.length
+            ? data.message.join(', ')
+            : data?.message || 'Failed to update thread message.';
+        throw new Error(message);
+      }
+
+      return data;
+    },
+    onSuccess: async (_data, variables) => {
+      await queryClient.invalidateQueries({
+        queryKey: [...projectThreadQueryKey, projectId],
+      });
+
+      const detailMessageId = variables.parentId || selectedThreadMessageId;
+      if (detailMessageId) {
+        await queryClient.invalidateQueries({
+          queryKey: [
+            ...projectThreadDetailQueryKey,
+            projectId,
+            detailMessageId,
+          ],
+        });
+      }
+
+      appToast.success('Thread updated successfully.');
+    },
+    onError: (error) => {
+      appToast.error(
+        error instanceof Error
+          ? error.message
+          : 'Failed to update thread message.',
+      );
+    },
+  });
+
+  const deleteProjectThreadMutation = useMutation({
+    mutationFn: async ({
+      messageId,
+      parentId: _parentId,
+    }: {
+      messageId: string;
+      parentId?: string;
+    }) => {
+      const response = await fetch(
+        `/api/projects/${projectId}/thread/${messageId}`,
+        {
+          method: 'DELETE',
+          headers: {
+            Accept: 'application/json',
+          },
+        },
+      );
+
+      const data = await response.json().catch(() => null);
+
+      if (!response.ok) {
+        const errorMessage =
+          Array.isArray(data?.message) && data.message.length
+            ? data.message.join(', ')
+            : data?.message || 'Failed to delete thread message.';
+        throw new Error(errorMessage);
+      }
+
+      return data;
+    },
+    onSuccess: async (_data, variables) => {
+      if (variables.parentId) {
+        updateProjectThreadReplyCount(
+          variables.parentId,
+          (currentCount) => currentCount - 1,
+        );
+      }
+
+      await queryClient.invalidateQueries({
+        queryKey: [...projectThreadQueryKey, projectId],
+      });
+
+      if (selectedThreadMessageId) {
+        await queryClient.invalidateQueries({
+          queryKey: [
+            ...projectThreadDetailQueryKey,
+            projectId,
+            selectedThreadMessageId,
+          ],
+        });
+      }
+
+      appToast.success('Thread deleted successfully.');
+    },
+    onError: (error) => {
+      appToast.error(
+        error instanceof Error
+          ? error.message
+          : 'Failed to delete thread message.',
+      );
+    },
+  });
+
+  const projectOptions = useMemo(
+    () => createTicketProjectOptions(projectsQuery.data ?? []),
+    [projectsQuery.data],
+  );
+
+  useEffect(() => {
+    setUploadedFilesState([]);
+    setSelectedThreadMessageId('');
+    setSearchValue('');
+  }, [projectId]);
+
+  const projectThreadReplies = useMemo(
+    () => flattenProjectThreadPages(projectThreadQuery.data?.pages),
+    [projectThreadQuery.data?.pages],
+  );
+
+  useEffect(() => {
+    if (!canViewThread || !projectId) {
+      setThreadSocketToken(null);
+      return;
+    }
+
+    let isDisposed = false;
+
+    void fetchSocketToken()
+      .then((token) => {
+        if (!isDisposed) {
+          setThreadSocketToken(token);
+        }
+      })
+      .catch(() => {
+        if (!isDisposed) {
+          setThreadSocketToken(null);
+        }
+      });
+
+    return () => {
+      isDisposed = true;
+    };
+  }, [canViewThread, projectId]);
+
+  const updateProjectTicketFilters = ({
+    status,
+    priority,
+    ticketType,
+    contactId,
+    dateFrom,
+    dateTo,
+    createdBy,
+    assignedTo,
+  }: {
+    status?: string;
+    priority?: string;
+    ticketType?: string;
+    contactId?: string;
+    dateFrom?: string;
+    dateTo?: string;
+    createdBy?: string;
+    assignedTo?: string;
+  }) => {
+    const nextSearchParams = new URLSearchParams(searchParams.toString());
+
+    const nextStatus = status ?? selectedStatus;
+    const nextPriority = priority ?? selectedPriority;
+    const nextTicketType = ticketType ?? selectedTicketType;
+    const nextContactId = contactId ?? selectedContactId;
+    const nextDateFrom = dateFrom ?? dateFromValue;
+    const nextDateTo = dateTo ?? dateToValue;
+    const nextCreatedBy = createdBy ?? selectedCreatedBy;
+    const nextAssignedTo = assignedTo ?? selectedAssignedTo;
+
+    nextSearchParams.set(PROJECT_TICKETS_STATUS_QUERY_PARAM, nextStatus);
+
+    if (nextPriority === 'all') {
+      nextSearchParams.delete(PROJECT_TICKETS_PRIORITY_QUERY_PARAM);
+    } else {
+      nextSearchParams.set(PROJECT_TICKETS_PRIORITY_QUERY_PARAM, nextPriority);
+    }
+
+    if (nextTicketType === 'all') {
+      nextSearchParams.delete(PROJECT_TICKETS_TYPE_QUERY_PARAM);
+    } else {
+      nextSearchParams.set(PROJECT_TICKETS_TYPE_QUERY_PARAM, nextTicketType);
+    }
+
+    if (nextContactId === 'all') {
+      nextSearchParams.delete(PROJECT_TICKETS_CONTACT_QUERY_PARAM);
+    } else {
+      nextSearchParams.set(PROJECT_TICKETS_CONTACT_QUERY_PARAM, nextContactId);
+    }
+
+    if (nextDateFrom) {
+      nextSearchParams.set(PROJECT_TICKETS_DATE_FROM_QUERY_PARAM, nextDateFrom);
+    } else {
+      nextSearchParams.delete(PROJECT_TICKETS_DATE_FROM_QUERY_PARAM);
+    }
+
+    if (nextDateTo) {
+      nextSearchParams.set(PROJECT_TICKETS_DATE_TO_QUERY_PARAM, nextDateTo);
+    } else {
+      nextSearchParams.delete(PROJECT_TICKETS_DATE_TO_QUERY_PARAM);
+    }
+
+    if (nextCreatedBy === 'all') {
+      nextSearchParams.delete(PROJECT_TICKETS_CREATED_BY_QUERY_PARAM);
+    } else {
+      nextSearchParams.set(
+        PROJECT_TICKETS_CREATED_BY_QUERY_PARAM,
+        nextCreatedBy,
+      );
+    }
+
+    if (nextAssignedTo === 'all') {
+      nextSearchParams.delete(PROJECT_TICKETS_ASSIGNED_TO_QUERY_PARAM);
+    } else {
+      nextSearchParams.set(
+        PROJECT_TICKETS_ASSIGNED_TO_QUERY_PARAM,
+        nextAssignedTo,
+      );
+    }
+
+    nextSearchParams.set(PROJECT_TICKETS_PAGE_QUERY_PARAM, '1');
+    setTicketsPagination((current) => ({ ...current, pageIndex: 0 }));
+
+    const nextQueryString = nextSearchParams.toString();
+
+    const currentQueryString = searchParams.toString();
+
+    if (nextQueryString === currentQueryString) {
+      return;
+    }
+
+    router.push(nextQueryString ? `${pathname}?${nextQueryString}` : pathname, {
+      scroll: false,
+    });
+  };
+
+  const hasActiveProjectTicketFilters =
+    Boolean(searchValue.trim()) ||
+    selectedStatus !== 'all' ||
+    selectedPriority !== 'all' ||
+    selectedTicketType !== 'all' ||
+    selectedContactId !== 'all' ||
+    Boolean(dateFromValue) ||
+    Boolean(dateToValue) ||
+    selectedCreatedBy !== 'all' ||
+    selectedAssignedTo !== 'all';
+
+  const clearProjectTicketFilters = () => {
+    setSearchValue('');
+
+    updateProjectTicketFilters({
+      status: 'all',
+      priority: 'all',
+      ticketType: 'all',
+      contactId: 'all',
+      dateFrom: '',
+      dateTo: '',
+      createdBy: 'all',
+      assignedTo: 'all',
+    });
+  };
+  const handleProjectTicketsViewChange = (nextViewMode: 'table' | 'kanban') => {
+    const nextSearchParams = new URLSearchParams(searchParams.toString());
+
+    if (nextViewMode === 'table') {
+      nextSearchParams.delete(PROJECT_TICKETS_VIEW_QUERY_PARAM);
+    } else {
+      nextSearchParams.set(PROJECT_TICKETS_VIEW_QUERY_PARAM, nextViewMode);
+
+      nextSearchParams.delete(PROJECT_TICKETS_STATUS_QUERY_PARAM);
+    }
+
+    nextSearchParams.set(PROJECT_TICKETS_PAGE_QUERY_PARAM, '1');
+
+    setTicketsPagination((current) => ({
+      ...current,
+      pageIndex: 0,
+    }));
+
+    const nextQueryString = nextSearchParams.toString();
+
+    router.replace(
+      nextQueryString ? `${pathname}?${nextQueryString}` : pathname,
+      {
+        scroll: false,
+      },
+    );
+  };
+
+  useEffect(() => {
+    if (projectDetailQuery.isError && !hasShownError.current) {
+      if (shouldRedirectToNotFound) {
+        hasShownError.current = true;
+        router.replace('/not-found');
+        return;
+      }
+
+      hasShownError.current = true;
+      appToast.error(
+        projectDetailQuery.error instanceof Error
+          ? projectDetailQuery.error.message
+          : 'Failed to load project.',
+      );
+    }
+
+    if (!projectDetailQuery.isError) {
+      hasShownError.current = false;
+    }
+  }, [
+    projectDetailQuery.error,
+    projectDetailQuery.isError,
+    router,
+    shouldRedirectToNotFound,
+  ]);
+
+  const projectTickets = useMemo(
+    () =>
+      (projectTicketsQuery.data?.items ?? []).map((ticket) => ({
+        ...ticket,
+
+        project: {
+          ...ticket.project,
+          id: project?.id ?? ticket.project.id,
+          name: project?.name ?? ticket.project.name,
+          initials: project?.initials ?? ticket.project.initials,
+          brandColor: project?.colorHex ?? ticket.project.brandColor,
+        },
+
+        statusColor:
+          ticket.statusColor ??
+          getTicketStatusColor(ticket.status, ticketStatusesQuery.data),
+      })),
+    [
+      projectTicketsQuery.data?.items,
+      ticketStatusesQuery.data,
+      project?.id,
+      project?.name,
+      project?.initials,
+      project?.colorHex,
+    ],
+  );
+  const projectFiles = useMemo(() => {
+    const normalizedSearch = fileSearchValue.trim().toLowerCase();
+    const files = [...uploadedFilesState, ...(projectFilesQuery.data ?? [])];
+
+    return files.filter((file) => {
+      if (!normalizedSearch) return true;
+
+      return (
+        file.name.toLowerCase().includes(normalizedSearch) ||
+        file.uploadedBy?.toLowerCase().includes(normalizedSearch) ||
+        file.uploadedAt?.toLowerCase().includes(normalizedSearch)
+      );
+    });
+  }, [fileSearchValue, projectFilesQuery.data, uploadedFilesState]);
+
+  const selectedThreadRoot = useMemo(() => {
+    if (!selectedThreadMessageId) {
+      return null;
+    }
+
+    return (
+      projectThreadReplies.find(
+        (reply) => reply.id === selectedThreadMessageId,
+      ) ?? null
+    );
+  }, [projectThreadReplies, selectedThreadMessageId]);
+
+  const selectedThreadHeader = useMemo(() => {
+    if (!selectedThreadMessageId) {
+      return null;
+    }
+
+    return projectThreadDetailQuery.data?.header ?? selectedThreadRoot ?? null;
+  }, [
+    projectThreadDetailQuery.data,
+    selectedThreadMessageId,
+    selectedThreadRoot,
+  ]);
+
+  const selectedThreadReplies = useMemo(() => {
+    if (!selectedThreadMessageId) {
+      return [];
+    }
+
+    return projectThreadDetailQuery.data?.replies ?? [];
+  }, [projectThreadDetailQuery.data, selectedThreadMessageId]);
+  const projectNotes = useMemo(
+    () => projectNotesQuery.data?.items ?? [],
+    [projectNotesQuery.data?.items],
+  );
+  const fullNotesQueries = useQueries({
+    queries: projectNotes.map((note) => ({
+      queryKey: ['project-note-detail', projectId, note.id],
+      queryFn: async (): Promise<ProjectNoteRecord> => {
+        const response = await fetch(
+          `/api/projects/${projectId}/notes/${note.id}`,
+        );
+
+        if (!response.ok) {
+          return note;
+        }
+
+        return response.json();
+      },
+      enabled: Boolean(projectId && note.id),
+    })),
+  });
+
+  const fullNotesById = new Map(
+    fullNotesQueries
+      .map((query) => query.data)
+      .filter((note): note is ProjectNoteRecord => Boolean(note))
+      .map((note) => [note.id, note]),
+  );
+  const selectedProjectNoteSummary = useMemo(
+    () =>
+      projectNotes.find((note) => note.id === selectedProjectNoteId) ??
+      (!isCreatingProjectNote ? projectNotes[0] : null) ??
+      null,
+    [isCreatingProjectNote, projectNotes, selectedProjectNoteId],
+  );
+  const selectedProjectNote =
+    !canViewProjectNoteDetail || isCreatingProjectNote
+      ? null
+      : (projectNoteDetailQuery.data ?? null);
+
+  useEffect(() => {
+    if (!projectNotes.length) {
+      if (selectedProjectNoteId) {
+        setSelectedProjectNoteId('');
+      }
+
+      return;
+    }
+
+    const hasSelectedNote = projectNotes.some(
+      (note) => note.id === selectedProjectNoteId,
+    );
+
+    if (!hasSelectedNote && !isCreatingProjectNote) {
+      setSelectedProjectNoteId(projectNotes[0].id);
+    }
+  }, [isCreatingProjectNote, projectNotes, selectedProjectNoteId]);
+
+  useEffect(() => {
+    if (!isMobile && isProjectNoteMobileModalOpen) {
+      setIsProjectNoteMobileModalOpen(false);
+    }
+  }, [isMobile, isProjectNoteMobileModalOpen]);
+
+  useEffect(() => {
+    if (isCreatingProjectNote) {
+      return;
+    }
+
+    if (
+      pendingProjectNoteEditId &&
+      selectedProjectNote?.id === pendingProjectNoteEditId
+    ) {
+      setIsEditingProjectNote(true);
+      setProjectNoteTitleDraft(selectedProjectNote.title);
+      setProjectNoteDescriptionDraft(selectedProjectNote.description);
+      setPendingProjectNoteEditId('');
+      return;
+    }
+
+    if (isEditingProjectNote) {
+      return;
+    }
+
+    setIsEditingProjectNote(false);
+    setProjectNoteTitleDraft(selectedProjectNote?.title ?? '');
+    setProjectNoteDescriptionDraft(selectedProjectNote?.description ?? '');
+  }, [
+    isCreatingProjectNote,
+    isEditingProjectNote,
+    pendingProjectNoteEditId,
+    selectedProjectNote,
+  ]);
+  const isProjectTicketsLoading =
+    projectTicketsViewMode === 'kanban'
+      ? projectKanbanBoardQuery.isLoading ||
+        projectKanbanCountsQuery.isLoading ||
+        ticketStatusesQuery.isLoading
+      : projectTicketsQuery.isLoading;
+  const handleStartCreatingProjectNote = () => {
+    if (isMobile) {
+      setIsProjectNoteMobileModalOpen(true);
+    }
+
+    setIsCreatingProjectNote(true);
+    setIsEditingProjectNote(false);
+    setPendingProjectNoteEditId('');
+    setSelectedProjectNoteId('');
+    setProjectNoteTitleDraft('');
+    setProjectNoteDescriptionDraft('');
+  };
+
+  const handleCancelCreatingProjectNote = () => {
+    setIsCreatingProjectNote(false);
+    setProjectNoteTitleDraft(selectedProjectNote?.title ?? '');
+    setProjectNoteDescriptionDraft(selectedProjectNote?.description ?? '');
+  };
+
+  const handleStartEditingProjectNote = () => {
+    if (!selectedProjectNote) {
+      return;
+    }
+
+    if (isMobile) {
+      setIsProjectNoteMobileModalOpen(true);
+    }
+
+    setIsEditingProjectNote(true);
+    setProjectNoteTitleDraft(selectedProjectNote.title);
+    setProjectNoteDescriptionDraft(selectedProjectNote.description);
+  };
+
+  const handleCancelEditingProjectNote = () => {
+    setIsEditingProjectNote(false);
+    setPendingProjectNoteEditId('');
+    setProjectNoteTitleDraft(selectedProjectNote?.title ?? '');
+    setProjectNoteDescriptionDraft(selectedProjectNote?.description ?? '');
+  };
+
+  const handleCloseProjectNoteMobileModal = () => {
+    setIsProjectNoteMobileModalOpen(false);
+    setIsEditingProjectNote(false);
+    setPendingProjectNoteEditId('');
+
+    if (isCreatingProjectNote) {
+      setIsCreatingProjectNote(false);
+      setSelectedProjectNoteId('');
+      setProjectNoteTitleDraft('');
+      setProjectNoteDescriptionDraft('');
+      return;
+    }
+
+    setProjectNoteTitleDraft(selectedProjectNote?.title ?? '');
+    setProjectNoteDescriptionDraft(selectedProjectNote?.description ?? '');
+  };
+
+  const handleCreateProjectNote = async () => {
+    const normalizedTitle = projectNoteTitleDraft.trim();
+
+    if (!normalizedTitle) {
+      appToast.error('Note title is required.');
+      return;
+    }
+
+    const createdNote = await createProjectNoteMutation.mutateAsync({
+      projectId,
+      values: {
+        title: normalizedTitle,
+        description: projectNoteDescriptionDraft,
+      },
+    });
+
+    setIsCreatingProjectNote(false);
+    setSelectedProjectNoteId(createdNote.id);
+    setPendingProjectNoteEditId('');
+    setProjectNoteTitleDraft(createdNote.title);
+    setProjectNoteDescriptionDraft(createdNote.description);
+    appToast.success('Note created successfully.');
+  };
+
+  const handleUpdateProjectNote = async () => {
+    if (!selectedProjectNote) {
+      return;
+    }
+
+    const normalizedTitle = projectNoteTitleDraft.trim();
+
+    if (!normalizedTitle) {
+      appToast.error('Note title is required.');
+      return;
+    }
+
+    const updatedNote = await updateProjectNoteMutation.mutateAsync({
+      projectId,
+      noteId: selectedProjectNote.id,
+      values: {
+        title: normalizedTitle,
+        description: projectNoteDescriptionDraft,
+      },
+    });
+
+    setIsEditingProjectNote(false);
+    setPendingProjectNoteEditId('');
+    setProjectNoteTitleDraft(updatedNote.title);
+    setProjectNoteDescriptionDraft(updatedNote.description);
+    appToast.success('Note updated successfully.');
+  };
+
+  const handleDeleteProjectNote = async () => {
+    if (!projectNoteToDelete) {
+      return;
+    }
+
+    const deletingNoteId = projectNoteToDelete.id;
+    const isDeletingSelectedNote = selectedProjectNoteId === deletingNoteId;
+    const nextNote = isDeletingSelectedNote
+      ? (projectNotes.find((note) => note.id !== deletingNoteId) ?? null)
+      : null;
+
+    if (isDeletingSelectedNote) {
+      setSelectedProjectNoteId(nextNote?.id ?? '');
+      setProjectNoteTitleDraft(nextNote?.title ?? '');
+      setProjectNoteDescriptionDraft(nextNote?.description ?? '');
+      setIsEditingProjectNote(false);
+      setPendingProjectNoteEditId('');
+    }
+
+    await deleteProjectNoteMutation.mutateAsync({
+      projectId,
+      noteId: deletingNoteId,
+    });
+
+    setProjectNoteToDelete(null);
+    setIsEditingProjectNote(false);
+    setIsCreatingProjectNote(false);
+
+    appToast.success('Note deleted successfully.');
+  };
+
+  const invalidateThreadQueries = useCallback(() => {
+    void queryClient.invalidateQueries({
+      queryKey: [...projectThreadQueryKey, projectId],
+    });
+
+    if (selectedThreadMessageId) {
+      void queryClient.invalidateQueries({
+        queryKey: [
+          ...projectThreadDetailQueryKey,
+          projectId,
+          selectedThreadMessageId,
+        ],
+      });
+    }
+  }, [queryClient, projectId, selectedThreadMessageId]);
+  useThread({
+    projectId,
+    token: threadSocketToken,
+    enabled: canViewThread,
+    onCreated: () => {
+      void queryClient.invalidateQueries({
+        queryKey: [...projectThreadQueryKey, projectId],
+      });
+    },
+    onReplyCreated: (reply) => {
+      const parentId =
+        reply && typeof reply === 'object' && 'parentId' in reply
+          ? String((reply as { parentId?: string }).parentId ?? '')
+          : '';
+
+      if (parentId) {
+        updateProjectThreadReplyCount(
+          parentId,
+          (currentCount) => currentCount + 1,
+        );
+      }
+
+      void queryClient.invalidateQueries({
+        queryKey: [...projectThreadQueryKey, projectId],
+      });
+
+      if (parentId) {
+        void queryClient.invalidateQueries({
+          queryKey: [...projectThreadDetailQueryKey, projectId, parentId],
+        });
+      }
+    },
+    onUpdated: invalidateThreadQueries,
+    onReacted: invalidateThreadQueries,
+
+    onDeleted: () => {
+      void queryClient.invalidateQueries({
+        queryKey: [...projectThreadQueryKey, projectId],
+      });
+
+      if (selectedThreadMessageId) {
+        void queryClient.invalidateQueries({
+          queryKey: [
+            ...projectThreadDetailQueryKey,
+            projectId,
+            selectedThreadMessageId,
+          ],
+        });
+      }
+    },
+  });
+
+  const handleCreateTicket = async (values: CreateTicketFormValues) => {
+    if (!canCreateTicket) {
+      return;
+    }
+
+    try {
+      setLoading(true);
+      await createTicket({
+        projectId: values.project,
+        title: values.title,
+        description: values.description,
+        statusKey: values.status,
+        assigneeId: values.assigneeId || undefined,
+        ticketType: values.ticketType,
+        contactId: values.contactId || undefined,
+        attachments: values.attachments,
+      });
+      await queryClient.invalidateQueries({
+        queryKey: [...projectTicketsQueryKey, projectId],
+      });
+      await Promise.all([
+        queryClient.invalidateQueries({
+          queryKey: ['dashboard-project-tickets'],
+          refetchType: 'all',
+        }),
+        queryClient.invalidateQueries({
+          queryKey: ['dashboard', 'recent-tickets'],
+          refetchType: 'all',
+        }),
+        queryClient.invalidateQueries({
+          queryKey: ['dashboard', 'upcoming'],
+          refetchType: 'all',
+        }),
+        queryClient.invalidateQueries({
+          queryKey: ['dashboard', 'critical-tickets'],
+          refetchType: 'all',
+        }),
+        queryClient.invalidateQueries({
+          queryKey: ['dashboard', 'ticket-summary'],
+          refetchType: 'all',
+        }),
+        queryClient.invalidateQueries({
+          queryKey: projectsQueryKey,
+          refetchType: 'all',
+        }),
+      ]);
+      appToast.success('Lead created successfully.');
+    } catch (error) {
+      appToast.error(
+        error instanceof Error ? error.message : 'Failed to create lead.',
+      );
+      throw error;
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleUploadFile = async (values: UploadFileFormValues) => {
+    if (!canUploadFiles) {
+      return;
+    }
+
+    try {
+      setLoading(true);
+      await uploadProjectFilesMutation.mutateAsync({ projectId, values });
+      appToast.success('File uploaded successfully.');
+    } catch (error) {
+      appToast.error(
+        error instanceof Error ? error.message : 'Failed to upload file.',
+      );
+      throw error;
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleDeleteTicket = async () => {
+    if (!ticketToDelete || !canDeleteTicket) {
+      return;
+    }
+
+    try {
+      setLoading(true);
+      await deleteTicketMutation.mutateAsync({
+        projectId,
+        ticketId: ticketToDelete.id,
+      });
+      await Promise.all([
+        queryClient.invalidateQueries({
+          queryKey: [...projectTicketsQueryKey, projectId],
+        }),
+        queryClient.invalidateQueries({
+          queryKey: ['project-kanban-board', projectId],
+        }),
+        queryClient.invalidateQueries({
+          queryKey: ['project-kanban-counts', projectId],
+        }),
+      ]);
+      appToast.success('Lead deleted successfully.');
+      setTicketToDelete(null);
+    } catch (error) {
+      appToast.error(
+        error instanceof Error ? error.message : 'Failed to delete lead.',
+      );
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleMoveTicketProject = async (targetProjectId: string) => {
+    if (!ticketToMove || !canChangeTicketProject) return;
+
+    try {
+      setLoading(true);
+      await moveTicketProjectMutation.mutateAsync({
+        ticketId: ticketToMove.id,
+        sourceProjectId: projectId,
+        targetProjectId,
+      });
+      const targetProject = projectsQuery.data?.find(
+        (item) => item.id === targetProjectId,
+      );
+      appToast.success(
+        targetProject
+          ? `Lead moved to ${targetProject.name} successfully.`
+          : 'Lead moved successfully.',
+      );
+      setTicketToMove(null);
+    } catch (error) {
+      appToast.error(
+        error instanceof Error ? error.message : 'Failed to move lead.',
+      );
+      throw error;
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleDeleteFile = async () => {
+    if (!fileToDelete) {
+      return;
+    }
+
+    try {
+      setLoading(true);
+      await deleteProjectFileMutation.mutateAsync({
+        projectId,
+        fileId: fileToDelete.id,
+      });
+      appToast.success('File deleted successfully.');
+      setFileToDelete(null);
+    } catch (error) {
+      appToast.error(
+        error instanceof Error ? error.message : 'Failed to delete file.',
+      );
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleDeleteThreadAttachment = async (
+    attachment: DiscussionAttachment,
+  ) => {
+    try {
+      setLoading(true);
+      await deleteProjectFileMutation.mutateAsync({
+        projectId,
+        fileId: attachment.id,
+      });
+      await Promise.all([
+        queryClient.invalidateQueries({
+          queryKey: [...projectThreadQueryKey, projectId],
+        }),
+        selectedThreadMessageId
+          ? queryClient.invalidateQueries({
+              queryKey: [
+                ...projectThreadDetailQueryKey,
+                projectId,
+                selectedThreadMessageId,
+              ],
+            })
+          : Promise.resolve(),
+      ]);
+      appToast.success('Attachment deleted successfully.');
+    } catch (error) {
+      appToast.error(
+        error instanceof Error ? error.message : 'Failed to delete attachment.',
+      );
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleSubmitReply = async ({
+    message,
+    attachments,
+    inlineAttachments,
+    mentionedUserIds,
+  }: {
+    message: string;
+    attachments: File[];
+    inlineAttachments: File[];
+    mentionedUserIds: string[];
+  }) => {
+    if (!canPostThreadMessage) {
+      return;
+    }
+
+    await createProjectThreadMutation.mutateAsync({
+      message,
+      attachments,
+      inlineAttachments,
+      mentionedUserIds,
+    });
+  };
+
+  const handleSubmitThreadReply = async ({
+    message,
+    attachments,
+    inlineAttachments,
+    mentionedUserIds,
+  }: {
+    message: string;
+    attachments: File[];
+    inlineAttachments: File[];
+    mentionedUserIds: string[];
+  }) => {
+    if (!canPostThreadReply || !selectedThreadMessageId) {
+      return;
+    }
+
+    await createProjectThreadMutation.mutateAsync({
+      message,
+      attachments,
+      inlineAttachments,
+      parentId: selectedThreadMessageId,
+      mentionedUserIds,
+    });
+  };
+
+  const handleEditProjectThreadReply = async ({
+    reply,
+    message,
+    inlineAttachments,
+    mentionedUserIds,
+  }: {
+    reply: DiscussionReply;
+    message: string;
+    inlineAttachments: File[];
+    mentionedUserIds: string[];
+  }) => {
+    setEditingThreadReplyId(reply.id);
+
+    try {
+      const uploadedInlineAttachments = inlineAttachments.length
+        ? await uploadFilesDirectly(
+            inlineAttachments,
+            `projects/${projectId}/threads`,
+          )
+        : [];
+      const storedMessage = replaceInlineAttachmentUrls(
+        message.trim(),
+        inlineAttachments,
+        uploadedInlineAttachments,
+      );
+      await updateProjectThreadMutation.mutateAsync({
+        messageId: reply.id,
+        message: storedMessage,
+        mentionedUserIds,
+        parentId:
+          selectedThreadMessageId && selectedThreadMessageId !== reply.id
+            ? selectedThreadMessageId
+            : undefined,
+      });
+    } finally {
+      setEditingThreadReplyId('');
+    }
+  };
+
+  const handleDeleteProjectThreadReply = async (reply: DiscussionReply) => {
+    try {
+      setDeletingThreadReplyId(reply.id);
+
+      if (selectedThreadMessageId === reply.id) {
+        setSelectedThreadMessageId('');
+      }
+
+      await deleteProjectThreadMutation.mutateAsync({
+        messageId: reply.id,
+        parentId:
+          selectedThreadMessageId && selectedThreadMessageId !== reply.id
+            ? selectedThreadMessageId
+            : undefined,
+      });
+    } finally {
+      setDeletingThreadReplyId('');
+    }
+  };
+
+  const updateThreadReactionInDetail = (
+    detail:
+      | {
+          header: DiscussionReply | null;
+          replies: DiscussionReply[];
+        }
+      | undefined,
+    replyId: string,
+    emoji: string,
+    remove: boolean,
+  ) => {
+    if (!detail) {
+      return detail;
+    }
+
+    return {
+      ...detail,
+      header:
+        detail.header?.id === replyId
+          ? {
+              ...detail.header,
+              reactions: applyProjectThreadReactionUpdate(
+                detail.header.reactions ?? [],
+                emoji,
+                remove,
+                currentUserId,
+              ),
+            }
+          : detail.header,
+      replies: detail.replies.map((reply) =>
+        reply.id === replyId
+          ? {
+              ...reply,
+              reactions: applyProjectThreadReactionUpdate(
+                reply.reactions ?? [],
+                emoji,
+                remove,
+                currentUserId,
+              ),
+            }
+          : reply,
+      ),
+    };
+  };
+
+  const handleToggleProjectThreadReaction = async (
+    reply: DiscussionReply,
+    emoji: string,
+  ) => {
+    const remove = Boolean(
+      reply.reactions?.some(
+        (reaction) => reaction.emoji === emoji && reaction.reactedByCurrentUser,
+      ),
+    );
+
+    const threadQueryKey = [
+      ...projectThreadQueryKey,
+      projectId,
+      currentUserId,
+    ] as const;
+    const detailQueryKeys = selectedThreadMessageId
+      ? [
+          [
+            ...projectThreadDetailQueryKey,
+            projectId,
+            selectedThreadMessageId,
+            currentUserId,
+          ],
+        ]
+      : [];
+    const previousThreadReplies =
+      queryClient.getQueryData<InfiniteData<ProjectThreadPage>>(threadQueryKey);
+    const previousThreadDetails = detailQueryKeys.map((queryKey) => ({
+      queryKey,
+      data: queryClient.getQueryData<{
+        header: DiscussionReply | null;
+        replies: DiscussionReply[];
+      }>(queryKey),
+    }));
+
+    queryClient.setQueryData<InfiniteData<ProjectThreadPage>>(
+      threadQueryKey,
+      (current) =>
+        current
+          ? {
+              ...current,
+              pages: current.pages.map((page) => ({
+                ...page,
+                threads: page.threads.map((threadReply) =>
+                  threadReply.id === reply.id
+                    ? {
+                        ...threadReply,
+                        reactions: applyProjectThreadReactionUpdate(
+                          threadReply.reactions ?? [],
+                          emoji,
+                          remove,
+                          currentUserId,
+                        ),
+                      }
+                    : threadReply,
+                ),
+              })),
+            }
+          : current,
+    );
+
+    detailQueryKeys.forEach((queryKey) => {
+      queryClient.setQueryData<{
+        header: DiscussionReply | null;
+        replies: DiscussionReply[];
+      }>(queryKey, (current) =>
+        updateThreadReactionInDetail(current, reply.id, emoji, remove),
+      );
+    });
+
+    try {
+      await toggleProjectThreadReactionMutation.mutateAsync({
+        messageId: reply.id,
+        emoji,
+        remove,
+      });
+
+      await queryClient.invalidateQueries({
+        queryKey: threadQueryKey,
+      });
+
+      if (selectedThreadMessageId) {
+        await queryClient.invalidateQueries({
+          queryKey: [
+            ...projectThreadDetailQueryKey,
+            projectId,
+            selectedThreadMessageId,
+            currentUserId,
+          ],
+        });
+      }
+    } catch (error) {
+      queryClient.setQueryData(threadQueryKey, previousThreadReplies);
+      previousThreadDetails.forEach(({ queryKey, data }) => {
+        queryClient.setQueryData(queryKey, data);
+      });
+      throw error;
+    }
+  };
+
+  const visibleProjectTabs = projectTabs.filter((tab) => {
+    if (tab === 'Leads') return canViewTickets;
+    if (tab === 'Thread') return canViewThread;
+    if (tab === 'Files') return canViewFiles;
+    if (tab === 'Calendar') return canViewCalendar;
+    if (tab === 'Notes') return canViewProjectNotesList;
+    return false;
+  });
+  const defaultProjectTabIndex = useMemo(() => {
+    const requestedTab = searchParams.get('t');
+    const requestedTabName =
+      requestedTab === '1'
+        ? 'Thread'
+        : requestedTab === '2'
+          ? 'Files'
+          : requestedTab === '4'
+            ? 'Notes'
+            : requestedTab === '3'
+              ? 'Calendar'
+              : null;
+
+    if (!requestedTabName) {
+      return 0;
+    }
+
+    const requestedTabIndex = visibleProjectTabs.indexOf(requestedTabName);
+    return requestedTabIndex >= 0 ? requestedTabIndex : 0;
+  }, [searchParams, visibleProjectTabs]);
+  const handleProjectTabChange = useCallback(
+    (index: number) => {
+      const selectedTab = visibleProjectTabs[index];
+
+      if (!selectedTab) {
+        return;
+      }
+
+      const nextTabQueryValue = projectTabQueryParamMap[selectedTab];
+      const nextSearchParams = new URLSearchParams(searchParams.toString());
+      const currentTabQueryValue = searchParams.get('t');
+
+      if (nextTabQueryValue) {
+        nextSearchParams.set('t', nextTabQueryValue);
+      } else {
+        nextSearchParams.delete('t');
+      }
+
+      const nextUrl = nextSearchParams.toString()
+        ? `${pathname}?${nextSearchParams.toString()}`
+        : pathname;
+      const currentUrl = searchParams.toString()
+        ? `${pathname}?${searchParams.toString()}`
+        : pathname;
+
+      if (
+        (nextTabQueryValue ?? null) === (currentTabQueryValue ?? null) &&
+        nextUrl === currentUrl
+      ) {
+        return;
+      }
+
+      router.replace(nextUrl, { scroll: false });
+    },
+    [pathname, router, searchParams, visibleProjectTabs],
+  );
+
+  // if (projectDetailQuery.isLoading) {
+  //   return <ProjectDetailSkeleton onBack={() => router.back()} />;
+  // }
+  if (projectDetailQuery.isLoading) {
+    return <ProjectDetailSkeleton activeTab={searchParams.get('t')} />;
+  }
+
+  if (shouldRedirectToNotFound) {
+    return null;
+  }
+
+  if (!canViewProjectDetail) {
+    return (
+      <div className="space-y-4 h-full py-8 pe-4">
+        <div className="rounded-[20px] h-full border border-gray-200 bg-white px-6 py-10 shadow-[0_0_35px_0_rgb(0_0_0/0.04)]">
+          <EmptyState
+            imageUrl="/images/EmptyProjectIcon.svg"
+            imageAlt="Project not found"
+            title="You do not have permission to view project details."
+            buttonLabel="Go Back"
+            onButtonClick={() => router.back()}
+          />
+        </div>
+      </div>
+    );
+  }
+
+  if (!project) {
+    return (
+      <div className="space-y-4 h-full py-8 pe-4">
+        <div className="rounded-3xl h-full border border-gray-200 bg-white px-6 py-10 shadow-[0_0_35px_0_rgb(0_0_0/0.04)]">
+          <EmptyState
+            imageUrl="/images/EmptyProjectIcon.svg"
+            imageAlt="Project not found"
+            title="Project not found"
+            buttonLabel="Go Back"
+            onButtonClick={() => router.back()}
+          />
+        </div>
+      </div>
+    );
+  }
+  const projectSummaryStats = [
+    ...(canViewTickets
+      ? [
+          {
+            title: 'Leads',
+            count: projectTicketsQuery.data?.meta.total ?? 0,
+            color: '#17B26A',
+          },
+        ]
+      : []),
+    ...(canViewThread
+      ? [
+          {
+            title: 'Thread Posts',
+            count: projectThreadReplies.length,
+            color: '#7A5AF8',
+          },
+        ]
+      : []),
+    ...(canViewFiles
+      ? [
+          {
+            title: 'Files',
+            count:
+              uploadedFilesState.length + (projectFilesQuery.data?.length ?? 0),
+            color: '#F79009',
+          },
+        ]
+      : []),
+  ];
+  return (
+    <>
+      <div className="relative z-100 h-full overflow-hidden pb-0 xl:h-dvh xl:px-0 xl:py-5 xl:pr-5">
+        <div className="flex h-full min-h-0 min-w-0 flex-col gap-3 overflow-y-auto overscroll-contain scrollbar-hide xl:overflow-hidden xl:rounded-2xl xl:border xl:border-white xl:bg-white/40 xl:p-3">
+          <div className="shrink-0">
+            <DashboardSummaryBanner
+              imageSrc="/images/bannerBackBtn.svg"
+              onBack={() => router.back()}
+              imageAlt="Leads"
+              title={project.name}
+              badge={project.category}
+              stats={projectSummaryStats}
+              badgeClr={project.colorHex}
+            />
+          </div>
+
+          <div className="mx-4 flex h-auto min-h-0 min-w-0 flex-none flex-col gap-4 overflow-visible xl:rounded-xl bg-white xl:p-3 xl:shadow-[0_0_35px_0_rgb(0_0_0/0.04)] md:px-5 md:pt-4 xl:mx-0 xl:h-full xl:flex-1 xl:overflow-hidden">
+            <TabGroup
+              key={`${projectId}-${searchParams.get('t') ?? '0'}`}
+              defaultIndex={defaultProjectTabIndex}
+              onChange={handleProjectTabChange}
+              className="flex h-auto min-h-0 min-w-0 flex-none flex-col gap-4 overflow-visible xl:h-full xl:flex-1 xl:overflow-hidden"
+            >
+              <TabList className="flex shrink-0 overflow-x-auto scrollbar-hide border-b border-gray-200">
+                {visibleProjectTabs.map((tab) => (
+                  <Tab
+                    key={tab}
+                    className={({ selected }) =>
+                      clsx(
+                        'shrink-0 border-b-2 px-2 xl:px-4 pt-3 pb-1.5 text-sm font-semibold outline-none transition',
+                        selected
+                          ? 'border-[#3165F6] text-[#3165F6]'
+                          : 'border-transparent text-gray-500 hover:text-gray-700',
+                      )
+                    }
+                  >
+                    <span className="inline-flex items-center gap-2">
+                      <span className="inline-flex shrink-0 items-center justify-center">
+                        {renderProjectTabIcon(tab)}
+                      </span>
+                      <span>{tab}</span>
+                    </span>
+                  </Tab>
+                ))}
+              </TabList>
+
+              <TabPanels className="flex h-auto min-h-0 min-w-0 flex-none flex-col overflow-visible pb-2  xl:h-full xl:flex-1 xl:overflow-hidden">
+                <PermissionGuard permission="tickets.view_list">
+                  <TabPanel className="flex h-auto min-h-0 min-w-0 flex-none flex-col gap-4 overflow-visible xl:h-full xl:flex-1 xl:overflow-hidden">
+                    <div className="flex shrink-0 flex-col gap-3 rounded-xl">
+                      <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+                        <div className="flex items-center gap-3">
+                          <div className="w-full rounded-lg border border-gray-200 bg-white px-2.5 py-2 md:max-w-xs">
+                            <div className="flex items-center gap-2">
+                              <span className="shrink-0">
+                                <SearchIcon fill="#374151" />
+                              </span>
+
+                              <input
+                                type="text"
+                                value={searchValue}
+                                onChange={(event) =>
+                                  handleProjectTicketSearchChange(
+                                    event.target.value,
+                                  )
+                                }
+                                placeholder="Search"
+                                className="min-w-0 flex-1 bg-transparent text-base text-gray-900 outline-none placeholder:text-gray-400"
+                              />
+
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  handleProjectTicketSearchChange('')
+                                }
+                                disabled={!searchValue}
+                                tabIndex={searchValue ? 0 : -1}
+                                className={`flex h-6 w-6 shrink-0 items-center justify-center rounded-full transition ${
+                                  searchValue
+                                    ? 'visible hover:bg-gray-100'
+                                    : 'pointer-events-none invisible'
+                                }`}
+                                aria-label="Clear search"
+                              >
+                                <CloseIcon width="15" height="15" />
+                              </button>
+                            </div>
+                          </div>
+
+                          {/* Mobile/tablet filter button */}
+                          <Popover as="div" className="relative xl:hidden">
+                            {({ open }) => (
+                              <>
+                                <PopoverButton
+                                  className={`flex h-10 shrink-0 items-center justify-center rounded-lg border px-3 text-sm font-medium outline-none ${
+                                    open || hasActiveProjectTicketFilters
+                                      ? 'border-primary bg-primary/5 text-primary'
+                                      : 'border-gray-200 bg-white text-gray-700'
+                                  }`}
+                                  aria-label="Open lead filters"
+                                >
+                                  <FiltersIcon />
+                                </PopoverButton>
+
+                                <PopoverPanel
+                                  anchor="bottom end"
+                                  transition
+                                  className="z-100 mt-2 flex w-56 origin-top-right flex-col gap-3 overflow-visible! rounded-xl border border-gray-200 bg-white p-3 shadow-[0_14px_44px_rgb(0_0_0/0.14)] outline-none transition duration-150 data-closed:-translate-y-2 data-closed:scale-95 data-closed:opacity-0"
+                                >
+                                  <div className="relative w-full overflow-visible">
+                                    <Dropdown
+                                      options={statusFilterOptions}
+                                      value={selectedStatus}
+                                      onChange={(value) =>
+                                        updateProjectTicketFilters({
+                                          status: value,
+                                        })
+                                      }
+                                      placeholder="All Status"
+                                      maxMenuHeight={150}
+                                    />
+                                  </div>
+
+                                  <div className="relative w-full overflow-visible">
+                                    <Dropdown
+                                      options={priorityFilterOptions}
+                                      value={selectedPriority}
+                                      onChange={(value) =>
+                                        updateProjectTicketFilters({
+                                          priority: value,
+                                        })
+                                      }
+                                      placeholder="All Priority"
+                                      maxMenuHeight={150}
+                                    />
+                                  </div>
+
+                                  <div className="relative w-full overflow-visible">
+                                    <Dropdown
+                                      options={contactFilterOptions}
+                                      value={selectedContactId}
+                                      onChange={(value) =>
+                                        updateProjectTicketFilters({
+                                          contactId: value,
+                                        })
+                                      }
+                                      showSearch={true}
+                                      placeholder="All Contacts"
+                                      maxMenuHeight={150}
+                                    />
+                                  </div>
+
+                                  <div className="relative w-full overflow-visible">
+                                    <Dropdown
+                                      options={createdByFilterOptions}
+                                      value={selectedCreatedBy}
+                                      onChange={(value) =>
+                                        updateProjectTicketFilters({
+                                          createdBy: value,
+                                        })
+                                      }
+                                      showSearch={true}
+                                      placeholder="All Creators"
+                                      maxMenuHeight={150}
+                                    />
+                                  </div>
+
+                                  <div className="relative w-full overflow-visible">
+                                    <Dropdown
+                                      options={assignedToFilterOptions}
+                                      value={selectedAssignedTo}
+                                      onChange={(value) =>
+                                        updateProjectTicketFilters({
+                                          assignedTo: value,
+                                        })
+                                      }
+                                      showSearch={true}
+                                      placeholder="All Agents"
+                                      maxMenuHeight={150}
+                                    />
+                                  </div>
+
+                                  <div className="flex items-center gap-2">
+                                    <ThemeInput
+                                      type="date"
+                                      value={dateFromValue}
+                                      onChange={(event) =>
+                                        updateProjectTicketFilters({
+                                          dateFrom: event.target.value,
+                                        })
+                                      }
+                                      max={dateToValue || undefined}
+                                      wrapperClassName="w-full"
+                                      aria-label="From date"
+                                    />
+                                    <span className="shrink-0 text-xs text-gray-400">
+                                      to
+                                    </span>
+                                    <ThemeInput
+                                      type="date"
+                                      value={dateToValue}
+                                      onChange={(event) =>
+                                        updateProjectTicketFilters({
+                                          dateTo: event.target.value,
+                                        })
+                                      }
+                                      min={dateFromValue || undefined}
+                                      wrapperClassName="w-full"
+                                      aria-label="To date"
+                                    />
+                                  </div>
+
+                                  <button
+                                    type="button"
+                                    onClick={clearProjectTicketFilters}
+                                    disabled={!hasActiveProjectTicketFilters}
+                                    className="rounded-lg border border-gray-200 px-3 py-2 text-xs font-medium text-gray-600 transition hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-50"
+                                  >
+                                    Clear Filters
+                                  </button>
+                                </PopoverPanel>
+                              </>
+                            )}
+                          </Popover>
+                        </div>
+                        <div className="flex flex-row items-center gap-3">
+                          <div className="hidden items-center rounded-lg border border-gray-200 bg-white xl:flex">
+                            <button
+                              type="button"
+                              onClick={() =>
+                                handleProjectTicketsViewChange('table')
+                              }
+                              className={`flex h-9 w-9 items-center justify-center rounded-md transition ${
+                                projectTicketsViewMode === 'table'
+                                  ? 'bg-aztec-purple  text-white shadow-sm'
+                                  : 'text-gray-500 hover:bg-gray-50'
+                              }`}
+                              aria-label="Table view"
+                            >
+                              <TableViewIcon />
+                            </button>
+
+                            <button
+                              type="button"
+                              onClick={() =>
+                                handleProjectTicketsViewChange('kanban')
+                              }
+                              className={`flex h-9 w-9 items-center justify-center rounded-md transition ${
+                                projectTicketsViewMode === 'kanban'
+                                  ? 'bg-aztec-purple text-white shadow-sm'
+                                  : 'text-gray-500 hover:bg-gray-50'
+                              }`}
+                              aria-label="Kanban view"
+                            >
+                              <KanbanViewIcon />
+                            </button>
+                          </div>
+
+                          <ThemeButton
+                            type="button"
+                            variant="secondary"
+                            icon={<FiltersIcon fill="currentColor" />}
+                            onClick={() =>
+                              setProjectTicketFiltersOpen((current) => !current)
+                            }
+                            aria-label="Open lead filters"
+                            aria-expanded={projectTicketFiltersOpen}
+                            aria-controls="project-ticket-filters"
+                            className={`hidden xl:inline-flex ${
+                              projectTicketFiltersOpen ||
+                              hasActiveProjectTicketFilters
+                                ? 'border-primary! bg-primary/5! text-primary! shadow-sm'
+                                : ''
+                            }`}
+                          >
+                            Filter
+                          </ThemeButton>
+
+                          {canCreateTicket ? (
+                            <ThemeButton
+                              className="hidden shrink-0 rounded-full xl:flex"
+                              variant="primaryGradient"
+                              icon={<PlusIcon width="20" height="20" />}
+                              onClick={() => setCreateTicketOpen(true)}
+                            >
+                              New Lead
+                            </ThemeButton>
+                          ) : null}
+                        </div>
+                      </div>
+
+                      <div
+                        className={`hidden w-full transition-[grid-template-rows,opacity,transform] duration-300 ease-out xl:grid ${
+                          projectTicketFiltersOpen
+                            ? 'grid-rows-[1fr] translate-y-0 opacity-100'
+                            : 'pointer-events-none grid-rows-[0fr] -translate-y-2 opacity-0'
+                        }`}
+                      >
+                        <div className="min-h-0 overflow-hidden">
+                          <div
+                            id="project-ticket-filters"
+                            className="flex w-full flex-row flex-wrap items-center justify-end gap-2 pt-1"
+                          >
+                            {projectTicketsViewMode === 'table' ? (
+                              <div className="w-full max-w-52">
+                                <Dropdown
+                                  options={statusFilterOptions}
+                                  value={selectedStatus}
+                                  onChange={(value) =>
+                                    updateProjectTicketFilters({
+                                      status: value,
+                                    })
+                                  }
+                                  placeholder="All Status"
+                                />
+                              </div>
+                            ) : null}
+
+                            <div className="w-full max-w-52">
+                              <Dropdown
+                                options={priorityFilterOptions}
+                                value={selectedPriority}
+                                onChange={(value) =>
+                                  updateProjectTicketFilters({
+                                    priority: value,
+                                  })
+                                }
+                                placeholder="All Priority"
+                              />
+                            </div>
+
+                            <div className="w-full max-w-52">
+                              <Dropdown
+                                options={contactFilterOptions}
+                                value={selectedContactId}
+                                onChange={(value) =>
+                                  updateProjectTicketFilters({
+                                    contactId: value,
+                                  })
+                                }
+                                showSearch={true}
+                                placeholder="All Contacts"
+                                maxMenuHeight={320}
+                              />
+                            </div>
+
+                            <div className="w-full max-w-52">
+                              <Dropdown
+                                options={createdByFilterOptions}
+                                value={selectedCreatedBy}
+                                onChange={(value) =>
+                                  updateProjectTicketFilters({
+                                    createdBy: value,
+                                  })
+                                }
+                                showSearch={true}
+                                placeholder="All Creators"
+                                maxMenuHeight={320}
+                              />
+                            </div>
+
+                            <div className="w-full max-w-52">
+                              <Dropdown
+                                options={assignedToFilterOptions}
+                                value={selectedAssignedTo}
+                                onChange={(value) =>
+                                  updateProjectTicketFilters({
+                                    assignedTo: value,
+                                  })
+                                }
+                                showSearch={true}
+                                placeholder="All Agents"
+                                maxMenuHeight={320}
+                              />
+                            </div>
+
+                            {projectTicketsViewMode === 'table' ? (
+                              <div className="flex items-center gap-2">
+                                <ThemeInput
+                                  type="date"
+                                  value={dateFromValue}
+                                  onChange={(event) =>
+                                    updateProjectTicketFilters({
+                                      dateFrom: event.target.value,
+                                    })
+                                  }
+                                  max={dateToValue || undefined}
+                                  wrapperClassName="w-full"
+                                  aria-label="From date"
+                                />
+                                <span className="shrink-0 text-xs text-gray-400">
+                                  to
+                                </span>
+                                <ThemeInput
+                                  type="date"
+                                  value={dateToValue}
+                                  onChange={(event) =>
+                                    updateProjectTicketFilters({
+                                      dateTo: event.target.value,
+                                    })
+                                  }
+                                  min={dateFromValue || undefined}
+                                  wrapperClassName="w-full"
+                                  aria-label="To date"
+                                />
+                              </div>
+                            ) : null}
+
+                            <ThemeButton
+                              type="button"
+                              variant="secondary"
+                              size="xs"
+                              onClick={clearProjectTicketFilters}
+                              disabled={!hasActiveProjectTicketFilters}
+                              className="disabled:cursor-not-allowed disabled:opacity-50"
+                            >
+                              Clear Filters
+                            </ThemeButton>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                    <div className="min-h-0 min-w-0 flex-none overflow-visible xl:flex-1 xl:overflow-hidden">
+                      {isProjectTicketsLoading ? (
+                        projectTicketsViewMode === 'kanban' ? (
+                          <TicketsKanbanSkeleton />
+                        ) : (
+                          <RecentTicketsTableSkeleton />
+                        )
+                      ) : projectTicketsViewMode === 'kanban' ? (
+                        <TicketsKanbanView
+                          tickets={projectKanbanTickets}
+                          onDeleteTicket={
+                            canDeleteTicket ? setTicketToDelete : undefined
+                          }
+                          statusOptions={kanbanStatusOptions}
+                          statusCountsByKey={
+                            projectKanbanCountsQuery.data ?? {}
+                          }
+                          hasMoreByStatus={
+                            projectKanbanBoardQuery.data?.hasMore ?? {}
+                          }
+                          loadingByStatus={loadingProjectKanbanStatuses}
+                          onLoadMoreStatus={(statusKey) => {
+                            void handleLoadMoreProjectKanbanStatus(statusKey);
+                          }}
+                          onTicketClick={
+                            canViewTicketDetail
+                              ? (ticket) =>
+                                  router.push(
+                                    `/tickets/${ticket.id}?projectId=${projectId}`,
+                                  )
+                              : undefined
+                          }
+                          onMoveTicket={(ticket, nextStatusKey) => {
+                            void handleMoveProjectTicket(ticket, nextStatusKey);
+                          }}
+                          onReorderColumn={handleReorderProjectStatusColumn}
+                          scrollRestorationKey={`projects.${projectId}.tickets-kanban-scroll-position`}
+                          canDragTickets={canEditTicketStatus}
+                          canDragColumns
+                          movingTicketId={
+                            moveProjectTicketMutation.isPending
+                              ? (moveProjectTicketMutation.variables?.ticket
+                                  .id ?? null)
+                              : null
+                          }
+                        />
+                      ) : (
+                        <RecentTicketsTable
+                          tickets={projectTickets}
+                          onDeleteTickets={
+                            canDeleteTicket ? setTicketToDelete : undefined
+                          }
+                          onChangeProject={
+                            canChangeTicketProject ? setTicketToMove : undefined
+                          }
+                          enablePagination
+                          pageSizeOptions={[10, 25, 50, 100]}
+                          pagination={ticketsPagination}
+                          onPaginationChange={
+                            handleProjectTicketsPaginationChange
+                          }
+                          totalRows={projectTicketsQuery.data?.meta.total ?? 0}
+                          manualPagination
+                          scrollRestorationKey={`projects.${projectId}.tickets-table-scroll-position`}
+                          getRowHref={
+                            canViewTicketDetail
+                              ? (ticket) =>
+                                  `/tickets/${ticket.id}?projectId=${projectId}`
+                              : undefined
+                          }
+                          onRowClick={
+                            canViewTicketDetail
+                              ? (ticket) =>
+                                  router.push(
+                                    `/tickets/${ticket.id}?projectId=${projectId}`,
+                                  )
+                              : undefined
+                          }
+                          hideProjectColumn
+                        />
+                      )}
+                    </div>
+                  </TabPanel>
+                </PermissionGuard>
+
+                <PermissionGuard permission="thread.view">
+                  <TabPanel className="h-auto min-h-0 min-w-0 overflow-visible xl:h-full xl:overflow-hidden">
+                    <div
+                      className={`grid h-auto min-h-0 min-w-0 overflow-visible rounded-sm border border-gray-200 md:rounded-2xl xl:h-full xl:overflow-hidden ${
+                        selectedThreadMessageId && !isMobile
+                          ? 'xl:grid-cols-[minmax(0,1fr)_400px] xl:grid-rows-[minmax(0,1fr)] xl:divide-x xl:divide-gray-200'
+                          : 'grid-cols-1'
+                      }`}
+                    >
+                      {(!isMobile || !selectedThreadMessageId) && (
+                        <div className="h-auto min-h-0 min-w-0 overflow-visible xl:h-full xl:overflow-hidden">
+                          {projectThreadQuery.isLoading ? (
+                            <ProjectThreadSkeleton />
+                          ) : (
+                            <ProjectThreadPanel
+                              title="Discussion"
+                              replies={projectThreadReplies}
+                              hasMoreReplies={Boolean(
+                                projectThreadQuery.hasNextPage,
+                              )}
+                              isLoadingMoreReplies={
+                                projectThreadQuery.isFetchingNextPage
+                              }
+                              onLoadMoreReplies={
+                                projectThreadQuery.hasNextPage
+                                  ? async () => {
+                                      await projectThreadQuery.fetchNextPage();
+                                    }
+                                  : undefined
+                              }
+                              mentionMembers={projectMembersQuery.data ?? []}
+                              emptyTitle="No Threads yet."
+                              emptyDescription="No Threads messages have been added to this project yet."
+                              composerPlaceholder="Post the project thread..."
+                              onSubmitReply={
+                                canPostThreadMessage
+                                  ? handleSubmitReply
+                                  : undefined
+                              }
+                              onEditReply={
+                                canEditThread
+                                  ? handleEditProjectThreadReply
+                                  : undefined
+                              }
+                              onDeleteReply={
+                                canDeleteThread
+                                  ? handleDeleteProjectThreadReply
+                                  : undefined
+                              }
+                              isSubmittingReply={
+                                createProjectThreadMutation.isPending &&
+                                !selectedThreadMessageId
+                              }
+                              deletingReplyId={deletingThreadReplyId}
+                              editingReplyId={editingThreadReplyId}
+                              canCompose={canPostThreadMessage}
+                              canAttachFile={canAttachThreadFile}
+                              requireMessage={false}
+                              currentUserId={currentUserId}
+                              showReplyMeta={
+                                canViewThreadReplies || canPostThreadReply
+                              }
+                              onReplyClick={(reply) =>
+                                setSelectedThreadMessageId(reply.id)
+                              }
+                              onDeleteAttachment={handleDeleteThreadAttachment}
+                              onToggleReaction={
+                                handleToggleProjectThreadReaction
+                              }
+                              deletingAttachmentId={
+                                deleteProjectFileMutation.isPending
+                                  ? deleteProjectFileMutation.variables?.fileId
+                                  : undefined
+                              }
+                            />
+                          )}
+                        </div>
+                      )}
+
+                      {selectedThreadMessageId ? (
+                        <div
+                          // className="h-full min-h-0 min-w-0 overflow-hidden"
+                          className="h-auto min-h-0 min-w-0 overflow-visible xl:h-full xl:overflow-hidden"
+                        >
+                          <ProjectThreadPanel
+                            title="Thread"
+                            subtitle=""
+                            mentionMembers={projectMembersQuery.data ?? []}
+                            headerAction={
+                              <button
+                                type="button"
+                                onClick={() => setSelectedThreadMessageId('')}
+                                className="flex h-6 w-6 items-center justify-center rounded-full text-gray-500 transition hover:bg-gray-100"
+                                aria-label="Close thread"
+                              >
+                                <CloseCrossIcon />
+                              </button>
+                            }
+                            headerReply={selectedThreadHeader}
+                            replies={selectedThreadReplies}
+                            emptyTitle={
+                              projectThreadDetailQuery.isLoading
+                                ? 'Loading thread...'
+                                : 'No threads replies yet.'
+                            }
+                            emptyDescription={
+                              projectThreadDetailQuery.isLoading
+                                ? 'Fetching thread replies.'
+                                : 'No Threads replies have been added to this thread yet.'
+                            }
+                            composerPlaceholder="Reply to thread..."
+                            onSubmitReply={
+                              canPostThreadReply
+                                ? handleSubmitThreadReply
+                                : undefined
+                            }
+                            onEditReply={
+                              canEditThread
+                                ? handleEditProjectThreadReply
+                                : undefined
+                            }
+                            onDeleteReply={
+                              canDeleteThread
+                                ? handleDeleteProjectThreadReply
+                                : undefined
+                            }
+                            isSubmittingReply={
+                              createProjectThreadMutation.isPending &&
+                              Boolean(selectedThreadMessageId)
+                            }
+                            deletingReplyId={deletingThreadReplyId}
+                            editingReplyId={editingThreadReplyId}
+                            canCompose={canPostThreadReply}
+                            canAttachFile={
+                              canAttachThreadFile && canPostThreadReply
+                            }
+                            requireMessage={false}
+                            currentUserId={currentUserId}
+                            onToggleReaction={handleToggleProjectThreadReaction}
+                            onDeleteAttachment={handleDeleteThreadAttachment}
+                            deletingAttachmentId={
+                              deleteProjectFileMutation.isPending
+                                ? deleteProjectFileMutation.variables?.fileId
+                                : undefined
+                            }
+                          />
+                        </div>
+                      ) : null}
+                    </div>
+                  </TabPanel>
+                </PermissionGuard>
+
+                <PermissionGuard permission="files.view">
+                  <TabPanel className="h-auto min-h-0 min-w-0 overflow-visible xl:h-full xl:overflow-hidden">
+                    {projectFilesQuery.isLoading ? (
+                      <ProjectFilesSkeleton />
+                    ) : (
+                      <ProjectFilesPanel
+                        files={projectFiles}
+                        searchValue={fileSearchValue}
+                        onSearchChange={setFileSearchValue}
+                        onUploadClick={
+                          canUploadFiles
+                            ? () => setUploadFileOpen(true)
+                            : undefined
+                        }
+                        onDeleteFile={setFileToDelete}
+                        canDownloadFile={canDownloadFiles}
+                        deletingFileId={
+                          deleteProjectFileMutation.isPending
+                            ? deleteProjectFileMutation.variables?.fileId
+                            : undefined
+                        }
+                        subtitle={`${
+                          uploadedFilesState.length +
+                          (projectFilesQuery.data?.length ?? 0)
+                        } files`}
+                      />
+                    )}
+                  </TabPanel>
+                </PermissionGuard>
+
+                <PermissionGuard permission="calendar.view_grid">
+                  <TabPanel className="h-auto min-h-0 overflow-visible xl:h-full xl:overflow-y-auto">
+                    <Calendar projectId={projectId} />
+                  </TabPanel>
+                </PermissionGuard>
+
+                <PermissionGuard permission="projects_notes.view_list">
+                  <TabPanel className="h-auto min-h-0 overflow-visible xl:h-full border rounded-sm sm:rounded-2xl border-gray-200 xl:overflow-hidden">
+                    <div className="grid h-auto min-h-0 min-w-0 xl:h-full xl:grid-cols-[340px_minmax(0,1fr)]">
+                      <section className="flex min-h-96 flex-col overflow-hidden border-e border-gray-200 bg-white shadow-[0_0_35px_0_rgb(0_0_0/0.04)]">
+                        <div className="border-b border-gray-200 px-3.5 py-3.5 bg-gray-50">
+                          <div className="flex items-center justify-between gap-3">
+                            <div className="flex items-center gap-2">
+                              <h3 className="text-base font-bold text-gray-900">
+                                Notes
+                              </h3>
+                              <p className="text-xs font-medium border border-gray-200 px-1.5 py-0.5 rounded-full bg-white text-gray-600">
+                                {projectNotesQuery.data?.meta.total ?? 0} notes
+                              </p>
+                            </div>
+                            {canCreateProjectNote ? (
+                              <ThemeButton
+                                type="button"
+                                variant="primaryGradient"
+                                size="sm"
+                                icon={<PlusIcon width="14" height="14" />}
+                                onClick={handleStartCreatingProjectNote}
+                              >
+                                New
+                              </ThemeButton>
+                            ) : null}
+                          </div>
+
+                          <div className="mt-4 rounded-lg border border-gray-200 bg-white px-2.5 py-2">
+                            <div className="flex items-center gap-2">
+                              <span className="shrink-0">
+                                <SearchIcon fill="#374151" />
+                              </span>
+
+                              <input
+                                type="text"
+                                value={notesSearchValue}
+                                onChange={(event) =>
+                                  setNotesSearchValue(event.target.value)
+                                }
+                                placeholder="Search..."
+                                className="min-w-0 flex-1 bg-transparent text-sm text-gray-900 outline-none placeholder:text-gray-400"
+                              />
+                            </div>
+                          </div>
+                        </div>
+
+                        <div className="min-h-0 flex-1 scrollbar-thin overflow-y-auto bg-white">
+                          {projectNotesQuery.isLoading ? (
+                            <ProjectNotesListSkeleton />
+                          ) : projectNotes.length ? (
+                            <div>
+                              {projectNotes.map((note) => {
+                                const isActive =
+                                  note.id === selectedProjectNoteSummary?.id;
+
+                                return (
+                                  <article
+                                    key={note.id}
+                                    className={clsx(
+                                      'border-b px-2.5 py-3 transition last:border-b-0',
+                                      isActive
+                                        ? 'border-gray-200 bg-blue-50'
+                                        : 'border-gray-200 bg-white hover:bg-gray-50',
+                                    )}
+                                  >
+                                    <div className="flex items-start gap-3">
+                                      <button
+                                        type="button"
+                                        onClick={() => {
+                                          if (isMobile) {
+                                            setIsProjectNoteMobileModalOpen(
+                                              true,
+                                            );
+                                          }
+
+                                          setIsCreatingProjectNote(false);
+                                          setIsEditingProjectNote(false);
+                                          setPendingProjectNoteEditId('');
+                                          setSelectedProjectNoteId(note.id);
+                                        }}
+                                        className="min-w-0 flex-1 text-left space-y-1"
+                                      >
+                                        <h4 className="truncate text-base font-bold text-gray-900">
+                                          {note.title}
+                                        </h4>
+                                        <p className="line-clamp-1 text-sm text-gray-600">
+                                          {getProjectNotePreview(
+                                            fullNotesById.get(note.id) ?? note,
+                                          )}
+                                        </p>
+                                        <div className="flex items-center gap-1 text-xs font-normal text-gray-500">
+                                          <CalendarTabIcon
+                                            width="14"
+                                            height="14"
+                                          />
+                                          <span>
+                                            {formatProjectNoteDate(note)}
+                                          </span>
+                                        </div>
+                                      </button>
+
+                                      {canEditProjectNote ||
+                                      canDeleteProjectNote ? (
+                                        <Menu as="div" className="relative">
+                                          <MenuButton
+                                            type="button"
+                                            aria-label="Note actions"
+                                            className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-gray-500 outline-none transition hover:bg-white hover:text-gray-700"
+                                          >
+                                            <ThreedotIcon />
+                                          </MenuButton>
+
+                                          <MenuItems
+                                            anchor="bottom end"
+                                            transition
+                                            className="z-100 mt-1 w-32 origin-top-right rounded-xl border border-gray-200 bg-white p-1.5 shadow-[0_10px_30px_rgb(0_0_0/0.12)] outline-none transition duration-150 data-closed:-translate-y-1 data-closed:scale-95 data-closed:opacity-0"
+                                          >
+                                            {canEditProjectNote ? (
+                                              <MenuItem>
+                                                <button
+                                                  type="button"
+                                                  onClick={() => {
+                                                    if (isMobile) {
+                                                      setIsProjectNoteMobileModalOpen(
+                                                        true,
+                                                      );
+                                                    }
+
+                                                    setIsCreatingProjectNote(
+                                                      false,
+                                                    );
+                                                    setSelectedProjectNoteId(
+                                                      note.id,
+                                                    );
+                                                    setPendingProjectNoteEditId(
+                                                      note.id,
+                                                    );
+                                                  }}
+                                                  className="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-xs font-medium text-gray-700 outline-none transition data-focus:bg-gray-100"
+                                                >
+                                                  <EditIcon
+                                                    width="14"
+                                                    height="14"
+                                                  />
+                                                  Edit
+                                                </button>
+                                              </MenuItem>
+                                            ) : null}
+                                            {canDeleteProjectNote ? (
+                                              <MenuItem>
+                                                <button
+                                                  type="button"
+                                                  onClick={() =>
+                                                    setProjectNoteToDelete(note)
+                                                  }
+                                                  className="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-xs font-medium text-red-500 outline-none transition data-focus:bg-red-50"
+                                                >
+                                                  <TrashIcon
+                                                    width="16"
+                                                    height="16"
+                                                  />
+                                                  Delete
+                                                </button>
+                                              </MenuItem>
+                                            ) : null}
+                                          </MenuItems>
+                                        </Menu>
+                                      ) : null}
+                                    </div>
+                                  </article>
+                                );
+                              })}
+                            </div>
+                          ) : (
+                            <div className="flex h-full items-center justify-center p-4 md:p-5">
+                              <EmptyState
+                                imageUrl="/images/noNotesIllu.svg"
+                                imageAlt="No notes yet"
+                                title="No notes yet"
+                                description="Project notes will appear here once they are available."
+                              />
+                            </div>
+                          )}
+                        </div>
+                      </section>
+
+                      <section className="flex min-h-96 flex-col overflow-hidden  bg-white shadow-[0_0_35px_0_rgb(0_0_0/0.04)]">
+                        {isCreatingProjectNote ? (
+                          <>
+                            {isMobile ? (
+                              <AppModal
+                                onClose={handleCloseProjectNoteMobileModal}
+                                isOpen={isProjectNoteMobileModalOpen}
+                                scrollNeeded={true}
+                                title="Create Note"
+                                bodyPaddingClasses="flex min-h-0 flex-col"
+                              >
+                                <div className="border-b border-gray-200 px-4 py-4 md:px-5">
+                                  <input
+                                    type="text"
+                                    value={projectNoteTitleDraft}
+                                    onChange={(event) =>
+                                      setProjectNoteTitleDraft(
+                                        event.target.value,
+                                      )
+                                    }
+                                    className="w-full border-b border-b-gray-300 bg-transparent pb-3 text-base font-semibold text-gray-900 outline-none md:text-xl"
+                                    placeholder="Note title"
+                                  />
+                                </div>
+
+                                <div className="p-4 flex-1 md:p-5">
+                                  <RichTextEditor
+                                    value={projectNoteDescriptionDraft}
+                                    onChange={setProjectNoteDescriptionDraft}
+                                    placeholder="Write your project note..."
+                                    maxLength={
+                                      MAX_PROJECT_NOTE_DESCRIPTION_LENGTH
+                                    }
+                                    disabled={
+                                      createProjectNoteMutation.isPending
+                                    }
+                                    showCharacterCount
+                                    editorHeight="h-[50dvh] min-h-[18rem]"
+                                    editorClassName="text-sm font-normal text-gray-700"
+                                  />
+                                </div>
+                                <div className="w-full  px-3 pb-4 md:flex md:justify-end md:px-5">
+                                  <div className="grid w-full grid-cols-2 gap-2 md:flex md:w-auto md:items-center">
+                                    <ThemeButton
+                                      type="button"
+                                      variant="secondary"
+                                      size="sm"
+                                      onClick={
+                                        handleCloseProjectNoteMobileModal
+                                      }
+                                      disabled={
+                                        createProjectNoteMutation.isPending
+                                      }
+                                      className="w-full disabled:cursor-not-allowed disabled:opacity-60"
+                                      borderclassName="w-full"
+                                    >
+                                      Cancel
+                                    </ThemeButton>
+
+                                    <ThemeButton
+                                      type="button"
+                                      variant="primaryGradient"
+                                      size="sm"
+                                      onClick={() =>
+                                        void handleCreateProjectNote()
+                                      }
+                                      disabled={
+                                        createProjectNoteMutation.isPending
+                                      }
+                                      className="w-full disabled:cursor-not-allowed disabled:opacity-60"
+                                      borderclassName="w-full"
+                                    >
+                                      {createProjectNoteMutation.isPending
+                                        ? 'Saving...'
+                                        : 'Save Note'}
+                                    </ThemeButton>
+                                  </div>
+                                </div>
+                              </AppModal>
+                            ) : (
+                              <>
+                                <div className="border-b border-gray-200 px-4 py-4 md:px-5">
+                                  <input
+                                    type="text"
+                                    value={projectNoteTitleDraft}
+                                    onChange={(event) =>
+                                      setProjectNoteTitleDraft(
+                                        event.target.value,
+                                      )
+                                    }
+                                    className="w-full border-b border-b-gray-300 bg-transparent pb-3 text-base font-semibold text-gray-900 outline-none md:text-xl"
+                                    placeholder="Note title"
+                                  />
+                                </div>
+
+                                <div className=" flex flex-col mb-4 flex-1 overflow-y-auto p-4 md:p-5">
+                                  <RichTextEditor
+                                    value={projectNoteDescriptionDraft}
+                                    onChange={setProjectNoteDescriptionDraft}
+                                    placeholder="Write your project note..."
+                                    maxLength={
+                                      MAX_PROJECT_NOTE_DESCRIPTION_LENGTH
+                                    }
+                                    disabled={
+                                      createProjectNoteMutation.isPending
+                                    }
+                                    showCharacterCount
+                                    editorHeight="h-[20rem] xl:h-[calc(100%)] flex-1"
+                                    className="h-full"
+                                    editorClassName="text-sm font-normal text-gray-700"
+                                  />
+                                </div>
+                                <div className="flex items-center justify-end gap-3 px-3 md:px-5 pb-4">
+                                  <div className="flex items-center gap-2">
+                                    <ThemeButton
+                                      type="button"
+                                      variant="secondary"
+                                      size="sm"
+                                      onClick={handleCancelCreatingProjectNote}
+                                      disabled={
+                                        createProjectNoteMutation.isPending
+                                      }
+                                      className="disabled:cursor-not-allowed disabled:opacity-60"
+                                    >
+                                      Cancel
+                                    </ThemeButton>
+                                    <ThemeButton
+                                      type="button"
+                                      variant="primaryGradient"
+                                      size="sm"
+                                      onClick={() =>
+                                        void handleCreateProjectNote()
+                                      }
+                                      disabled={
+                                        createProjectNoteMutation.isPending
+                                      }
+                                      className="disabled:cursor-not-allowed disabled:opacity-60"
+                                    >
+                                      {createProjectNoteMutation.isPending
+                                        ? 'Saving...'
+                                        : 'Save Note'}
+                                    </ThemeButton>
+                                  </div>
+                                </div>
+                              </>
+                            )}
+                          </>
+                        ) : selectedProjectNote ? (
+                          <>
+                            {isMobile ? (
+                              <AppModal
+                                onClose={handleCloseProjectNoteMobileModal}
+                                isOpen={isProjectNoteMobileModalOpen}
+                                scrollNeeded={true}
+                                bodyPaddingClasses="flex  flex-col max-h-[calc(100dvh-200px)]"
+                                title="projectNoteTitleDraft"
+                              >
+                                <div className="px-4 pt-4 md:px-5 hidden sm:block">
+                                  <input
+                                    type="text"
+                                    value={projectNoteTitleDraft}
+                                    onChange={(event) =>
+                                      setProjectNoteTitleDraft(
+                                        event.target.value,
+                                      )
+                                    }
+                                    readOnly={!isEditingProjectNote}
+                                    className={`w-full ${!isEditingProjectNote ? 'pb-0' : 'border-b border-b-gray-300 pb-2'} bg-transparent text-base font-semibold text-gray-900 outline-none md:text-xl`}
+                                    placeholder="Note title"
+                                  />
+                                </div>
+                                <div
+                                  className={`${isEditingProjectNote ? 'pt-4' : ''} ps-4 md:ps-5 flex-1 max-h-[90dvh]`}
+                                >
+                                  {projectNoteDetailQuery.isLoading &&
+                                  selectedProjectNoteId ? (
+                                    <div className="space-y-4 pb-4 pt-2">
+                                      <div className="h-[50dvh] min-h-72 w-full animate-pulse rounded-lg bg-gray-100" />
+                                    </div>
+                                  ) : (
+                                    <>
+                                      <RichTextEditor
+                                        value={projectNoteDescriptionDraft}
+                                        onChange={
+                                          setProjectNoteDescriptionDraft
+                                        }
+                                        placeholder="No note description available."
+                                        readOnly={!isEditingProjectNote}
+                                        maxLength={
+                                          isEditingProjectNote
+                                            ? MAX_PROJECT_NOTE_DESCRIPTION_LENGTH
+                                            : undefined
+                                        }
+                                        showCharacterCount={
+                                          isEditingProjectNote
+                                        }
+                                        disabled={
+                                          updateProjectNoteMutation.isPending
+                                        }
+                                        className="flex-1 h-full a pe-2 md:pe-3"
+                                        editorHeight="min-h-[18rem] b border-none! h-full"
+                                        editorClassName={`text-sm c font-normal h-full text-gray-700 ${!isEditingProjectNote && 'px-0!'}`}
+                                      />
+                                    </>
+                                  )}
+                                </div>
+                                <div className="md:flex md:items-center md:justify-end  grid grid-cols-2 w-full mt-5 md:mt-0 gap-3  px-4 md:px-5 pb-3">
+                                  {isEditingProjectNote && (
+                                    <>
+                                      <ThemeButton
+                                        type="button"
+                                        variant="secondary"
+                                        size="sm"
+                                        onClick={handleCancelEditingProjectNote}
+                                        disabled={
+                                          updateProjectNoteMutation.isPending
+                                        }
+                                        className="disabled:cursor-not-allowed disabled:opacity-60"
+                                      >
+                                        Cancel
+                                      </ThemeButton>
+                                      <ThemeButton
+                                        type="button"
+                                        variant="primaryGradient"
+                                        size="sm"
+                                        onClick={() =>
+                                          void handleUpdateProjectNote()
+                                        }
+                                        disabled={
+                                          updateProjectNoteMutation.isPending
+                                        }
+                                        className="disabled:cursor-not-allowed disabled:opacity-60"
+                                      >
+                                        {updateProjectNoteMutation.isPending
+                                          ? 'Saving...'
+                                          : 'Save'}
+                                      </ThemeButton>
+                                    </>
+                                  )}
+                                  <div className="hidden items-center gap-2">
+                                    {isEditingProjectNote ? (
+                                      <>
+                                        <ThemeButton
+                                          type="button"
+                                          variant="secondary"
+                                          size="sm"
+                                          onClick={
+                                            handleCancelEditingProjectNote
+                                          }
+                                          disabled={
+                                            updateProjectNoteMutation.isPending
+                                          }
+                                          className="disabled:cursor-not-allowed disabled:opacity-60"
+                                        >
+                                          Cancel
+                                        </ThemeButton>
+                                        <ThemeButton
+                                          type="button"
+                                          variant="primaryGradient"
+                                          size="sm"
+                                          onClick={() =>
+                                            void handleUpdateProjectNote()
+                                          }
+                                          disabled={
+                                            updateProjectNoteMutation.isPending
+                                          }
+                                          className="disabled:cursor-not-allowed disabled:opacity-60"
+                                        >
+                                          {updateProjectNoteMutation.isPending
+                                            ? 'Saving...'
+                                            : 'Save'}
+                                        </ThemeButton>
+                                      </>
+                                    ) : canEditProjectNote ||
+                                      canDeleteProjectNote ? (
+                                      <>
+                                        {canEditProjectNote ? (
+                                          <ThemeButton
+                                            type="button"
+                                            variant="secondary"
+                                            size="sm"
+                                            onClick={
+                                              handleStartEditingProjectNote
+                                            }
+                                          >
+                                            Edit
+                                          </ThemeButton>
+                                        ) : null}
+                                        {canDeleteProjectNote ? (
+                                          <ThemeButton
+                                            type="button"
+                                            variant="secondary"
+                                            size="sm"
+                                            onClick={() =>
+                                              setProjectNoteToDelete(
+                                                selectedProjectNote,
+                                              )
+                                            }
+                                            className="border-red-200 text-red-600 hover:bg-red-50"
+                                          >
+                                            Delete
+                                          </ThemeButton>
+                                        ) : null}
+                                      </>
+                                    ) : null}
+                                  </div>
+                                </div>
+                              </AppModal>
+                            ) : (
+                              <>
+                                <div className="px-4 pt-4 md:px-5">
+                                  <input
+                                    type="text"
+                                    value={projectNoteTitleDraft}
+                                    onChange={(event) =>
+                                      setProjectNoteTitleDraft(
+                                        event.target.value,
+                                      )
+                                    }
+                                    readOnly={!isEditingProjectNote}
+                                    className={`w-full ${!isEditingProjectNote ? 'pb-0' : 'border-b border-b-gray-300 pb-2'} bg-transparent text-base font-semibold text-gray-900 outline-none md:text-xl`}
+                                    placeholder="Note title"
+                                  />
+                                </div>
+
+                                <div
+                                  className={` ${isEditingProjectNote && 'pt-4'} min-h-0 flex-1 overflow-y-auto px-4 md:px-5`}
+                                >
+                                  {projectNoteDetailQuery.isLoading &&
+                                  selectedProjectNoteId ? (
+                                    <div className="space-y-4 flex flex-col pb-4 pt-2 h-full">
+                                      <div className="flex-1 h-full w-full animate-pulse rounded-lg bg-gray-100" />
+                                    </div>
+                                  ) : (
+                                    <>
+                                      <RichTextEditor
+                                        value={projectNoteDescriptionDraft}
+                                        onChange={
+                                          setProjectNoteDescriptionDraft
+                                        }
+                                        placeholder="No note description available."
+                                        readOnly={!isEditingProjectNote}
+                                        maxLength={
+                                          isEditingProjectNote
+                                            ? MAX_PROJECT_NOTE_DESCRIPTION_LENGTH
+                                            : undefined
+                                        }
+                                        showCharacterCount={
+                                          isEditingProjectNote
+                                        }
+                                        disabled={
+                                          updateProjectNoteMutation.isPending
+                                        }
+                                        editorHeight={` flex-1 ${!isEditingProjectNote ? 'border-0! h-full' : 'h-[calc(100%-32px)]'}`}
+                                        className="h-full "
+                                        editorClassName={`text-sm font-normal h-full text-gray-700 ${!isEditingProjectNote && 'px-0!'}`}
+                                      />
+                                    </>
+                                  )}
+                                </div>
+                                <div className="flex items-center justify-end gap-3  px-4 md:px-5 pb-3">
+                                  {isEditingProjectNote && (
+                                    <>
+                                      <ThemeButton
+                                        type="button"
+                                        variant="secondary"
+                                        size="sm"
+                                        onClick={handleCancelEditingProjectNote}
+                                        disabled={
+                                          updateProjectNoteMutation.isPending
+                                        }
+                                        className="disabled:cursor-not-allowed disabled:opacity-60"
+                                      >
+                                        Cancel
+                                      </ThemeButton>
+                                      <ThemeButton
+                                        type="button"
+                                        variant="primaryGradient"
+                                        size="sm"
+                                        onClick={() =>
+                                          void handleUpdateProjectNote()
+                                        }
+                                        disabled={
+                                          updateProjectNoteMutation.isPending
+                                        }
+                                        className="disabled:cursor-not-allowed disabled:opacity-60"
+                                      >
+                                        {updateProjectNoteMutation.isPending
+                                          ? 'Saving...'
+                                          : 'Save'}
+                                      </ThemeButton>
+                                    </>
+                                  )}
+                                  <div className="hidden items-center gap-2">
+                                    {isEditingProjectNote ? (
+                                      <>
+                                        <ThemeButton
+                                          type="button"
+                                          variant="secondary"
+                                          size="sm"
+                                          onClick={
+                                            handleCancelEditingProjectNote
+                                          }
+                                          disabled={
+                                            updateProjectNoteMutation.isPending
+                                          }
+                                          className="disabled:cursor-not-allowed disabled:opacity-60"
+                                        >
+                                          Cancel
+                                        </ThemeButton>
+                                        <ThemeButton
+                                          type="button"
+                                          variant="primaryGradient"
+                                          size="sm"
+                                          onClick={() =>
+                                            void handleUpdateProjectNote()
+                                          }
+                                          disabled={
+                                            updateProjectNoteMutation.isPending
+                                          }
+                                          className="disabled:cursor-not-allowed disabled:opacity-60"
+                                        >
+                                          {updateProjectNoteMutation.isPending
+                                            ? 'Saving...'
+                                            : 'Save'}
+                                        </ThemeButton>
+                                      </>
+                                    ) : canEditProjectNote ||
+                                      canDeleteProjectNote ? (
+                                      <>
+                                        {canEditProjectNote ? (
+                                          <ThemeButton
+                                            type="button"
+                                            variant="secondary"
+                                            size="sm"
+                                            onClick={
+                                              handleStartEditingProjectNote
+                                            }
+                                          >
+                                            Edit
+                                          </ThemeButton>
+                                        ) : null}
+                                        {canDeleteProjectNote ? (
+                                          <ThemeButton
+                                            type="button"
+                                            variant="secondary"
+                                            size="sm"
+                                            onClick={() =>
+                                              setProjectNoteToDelete(
+                                                selectedProjectNote,
+                                              )
+                                            }
+                                            className="border-red-200 text-red-600 hover:bg-red-50"
+                                          >
+                                            Delete
+                                          </ThemeButton>
+                                        ) : null}
+                                      </>
+                                    ) : null}
+                                  </div>
+                                </div>
+                              </>
+                            )}
+                          </>
+                        ) : canViewProjectNoteDetail ? (
+                          <div className="flex h-full items-center justify-center p-4 md:p-5">
+                            <EmptyState
+                              imageUrl="/images/noNotesIllu.svg"
+                              imageAlt="Select a note"
+                              title="Select a note"
+                              description="Choose a note from the left sidebar to view its title and description."
+                              buttonIcon={
+                                canCreateProjectNote ? <PlusIcon /> : undefined
+                              }
+                              buttonLabel={
+                                canCreateProjectNote ? 'Add Note' : undefined
+                              }
+                              onButtonClick={
+                                canCreateProjectNote
+                                  ? handleStartCreatingProjectNote
+                                  : undefined
+                              }
+                            />
+                          </div>
+                        ) : (
+                          <div className="flex h-full items-center justify-center p-4 md:p-5">
+                            <EmptyState
+                              imageUrl="/images/noNotesIllu.svg"
+                              imageAlt="No note detail access"
+                              title="No detail access"
+                              description="You can view the notes list, but you do not have permission to open note details."
+                            />
+                          </div>
+                        )}
+                      </section>
+                    </div>
+                  </TabPanel>
+                </PermissionGuard>
+              </TabPanels>
+            </TabGroup>
+          </div>
+        </div>
+      </div>
+
+      <CreateTicketModal
+        isOpen={createTicketOpen && canCreateTicket}
+        onClose={() => setCreateTicketOpen(false)}
+        onConfirm={handleCreateTicket}
+        projectOptions={projectOptions}
+        preselectedProjectId={project.id}
+        disableProjectSelection
+      />
+
+      <ConfirmActionModal
+        isOpen={Boolean(ticketToDelete) && canDeleteTicket}
+        onClose={() => setTicketToDelete(null)}
+        title="Delete Lead?"
+        message={
+          <>
+            Are you sure you want to delete{' '}
+            <span className="font-semibold">
+              “{ticketToDelete?.title ?? 'this lead'}”
+            </span>
+            ? This action cannot be undone.
+          </>
+        }
+        confirmLabel="Yes, Delete"
+        cancelLabel="Cancel"
+        variant="danger"
+        isSubmitting={deleteTicketMutation.isPending}
+        onConfirm={handleDeleteTicket}
+      />
+
+      {ticketToMove?.project.id ? (
+        <MoveTicketModal
+          isOpen={canChangeTicketProject}
+          ticketRefNo={ticketToMove.ticketRefNo}
+          ticketTitle={ticketToMove.title}
+          currentProject={{
+            id: ticketToMove.project.id,
+            name: ticketToMove.project.name,
+          }}
+          projects={projectsQuery.data ?? []}
+          isSubmitting={moveTicketProjectMutation.isPending}
+          onClose={() => setTicketToMove(null)}
+          onConfirm={handleMoveTicketProject}
+        />
+      ) : null}
+
+      <UploadFileModal
+        isOpen={uploadFileOpen && canUploadFiles}
+        onClose={() => setUploadFileOpen(false)}
+        onConfirm={handleUploadFile}
+      />
+
+      <ConfirmActionModal
+        isOpen={Boolean(fileToDelete)}
+        onClose={() => setFileToDelete(null)}
+        title="Delete File?"
+        message={
+          <>
+            Are you sure you want to delete{' '}
+            <span className="font-semibold">
+              “{fileToDelete?.name ?? 'this file'}”
+            </span>
+            ? This action cannot be undone.
+          </>
+        }
+        confirmLabel="Yes, Delete"
+        cancelLabel="Cancel"
+        variant="danger"
+        isSubmitting={deleteProjectFileMutation.isPending}
+        onConfirm={handleDeleteFile}
+      />
+
+      <ConfirmActionModal
+        isOpen={Boolean(projectNoteToDelete)}
+        onClose={() => setProjectNoteToDelete(null)}
+        title="Delete Note?"
+        message={
+          <>
+            Are you sure you want to delete{' '}
+            <span className="font-semibold">
+              “{projectNoteToDelete?.title ?? 'this note'}”
+            </span>
+            ? This action cannot be undone.
+          </>
+        }
+        confirmLabel="Yes, Delete"
+        cancelLabel="Cancel"
+        variant="danger"
+        isSubmitting={deleteProjectNoteMutation.isPending}
+        onConfirm={handleDeleteProjectNote}
+      />
+    </>
+  );
+}
+
+function applyProjectThreadReactionUpdate(
+  reactions: DiscussionReaction[],
+  emoji: string,
+  remove: boolean,
+  currentUserId?: string,
+) {
+  const currentUserReaction = reactions.find(
+    (reaction) => reaction.reactedByCurrentUser,
+  );
+  let nextReactions = reactions.map((reaction) => ({ ...reaction }));
+
+  if (currentUserReaction && (!remove || currentUserReaction.emoji !== emoji)) {
+    nextReactions = decrementProjectThreadReaction(
+      nextReactions,
+      currentUserReaction.emoji,
+      currentUserId,
+    );
+  }
+
+  if (!remove) {
+    nextReactions = incrementProjectThreadReaction(
+      nextReactions,
+      emoji,
+      currentUserId,
+    );
+  }
+
+  return nextReactions;
+}
+
+function incrementProjectThreadReaction(
+  reactions: DiscussionReaction[],
+  emoji: string,
+  currentUserId?: string,
+) {
+  const existingReaction = reactions.find(
+    (reaction) => reaction.emoji === emoji,
+  );
+
+  if (!existingReaction) {
+    return [
+      ...reactions,
+      {
+        emoji,
+        count: 1,
+        reactedByCurrentUser: true,
+        actors: currentUserId
+          ? [{ id: currentUserId, name: 'You', isCurrentUser: true }]
+          : [{ name: 'You', isCurrentUser: true }],
+      },
+    ];
+  }
+
+  return reactions.map((reaction) =>
+    reaction.emoji === emoji
+      ? {
+          ...reaction,
+          count: reaction.count + (reaction.reactedByCurrentUser ? 0 : 1),
+          reactedByCurrentUser: true,
+          actors: reaction.reactedByCurrentUser
+            ? reaction.actors
+            : [
+                ...(reaction.actors ?? []),
+                currentUserId
+                  ? { id: currentUserId, name: 'You', isCurrentUser: true }
+                  : { name: 'You', isCurrentUser: true },
+              ],
+        }
+      : {
+          ...reaction,
+          reactedByCurrentUser: false,
+          actors:
+            reaction.actors?.map((actor) => ({
+              ...actor,
+              isCurrentUser: false,
+            })) ?? reaction.actors,
+        },
+  );
+}
+
+function decrementProjectThreadReaction(
+  reactions: DiscussionReaction[],
+  emoji: string,
+  currentUserId?: string,
+) {
+  return reactions
+    .flatMap((reaction) => {
+      if (reaction.emoji !== emoji) {
+        return [reaction];
+      }
+
+      if (reaction.count <= 1) {
+        return [];
+      }
+
+      return [
+        {
+          ...reaction,
+          count: reaction.count - 1,
+          reactedByCurrentUser: false,
+          actors:
+            reaction.actors?.filter((actor) =>
+              currentUserId ? actor.id !== currentUserId : !actor.isCurrentUser,
+            ) ?? reaction.actors,
+        },
+      ];
+    })
+    .map((reaction) =>
+      reaction.emoji === emoji
+        ? reaction
+        : {
+            ...reaction,
+            reactedByCurrentUser: false,
+            actors:
+              reaction.actors?.map((actor) => ({
+                ...actor,
+                isCurrentUser: false,
+              })) ?? reaction.actors,
+          },
+    );
+}
+
+function renderProjectTabIcon(tab: (typeof projectTabs)[number]) {
+  if (tab === 'Leads') {
+    return (
+      <TicketsIcon width="20" height="20" fill="currentColor" opacity="0" />
+    );
+  }
+
+  if (tab === 'Thread') {
+    return <ThreadIcon />;
+  }
+
+  if (tab === 'Files') {
+    return <FilesTabIcon />;
+  }
+
+  if (tab === 'Notes') {
+    return <NotesTabIcon />;
+  }
+
+  return <CalendarTabIcon />;
+}
+
+function getProjectNotePreview(note: ProjectNoteRecord) {
+  const description = stripProjectNoteHtml(note.description);
+
+  if (description) {
+    return description;
+  }
+
+  return 'No description added yet.';
+}
+
+function formatProjectNoteDate(note: ProjectNoteRecord) {
+  const dateValue = note.updatedAt || note.createdAt;
+
+  if (!dateValue) {
+    return 'No timestamp available';
+  }
+
+  const parsedDate = new Date(dateValue);
+
+  if (Number.isNaN(parsedDate.getTime())) {
+    return 'No timestamp available';
+  }
+
+  return `${note.updatedAt ? 'Updated' : 'Created'} ${new Intl.DateTimeFormat(
+    'en-US',
+    {
+      month: 'short',
+      day: 'numeric',
+      year: 'numeric',
+    },
+  ).format(parsedDate)}`;
+}
+
+function stripProjectNoteHtml(value: string) {
+  if (!value) return '';
+
+  return value
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'")
+    .replace(/&amp;/gi, '&')
+    .replace(/<[^>]*>/g, ' ')
+    .replace(/<[^>]*$/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+type ApiTicketSetting = {
+  id: string;
+  key: string;
+  label: string;
+  color: string;
+  sortOrder?: number;
+};
+
+function mapTicketSettingToDropdownOption(setting: ApiTicketSetting) {
+  return {
+    label: setting.label,
+    value: setting.key,
+    icon: (
+      <span
+        className="inline-block h-2.5 w-2.5 rounded-full"
+        style={{
+          backgroundColor: setting.color,
+        }}
+      />
+    ),
+  };
+}
+async function fetchTicketStatuses() {
+  const response = await fetch('/api/ticket-statuses', {
+    method: 'GET',
+    headers: {
+      Accept: 'application/json',
+    },
+    cache: 'no-store',
+  });
+
+  const payload = (await response.json().catch(() => null)) as
+    | ApiTicketSetting[]
+    | { message?: string }
+    | null;
+
+  if (!response.ok || !Array.isArray(payload)) {
+    throw new Error(
+      !Array.isArray(payload)
+        ? payload?.message || 'Failed to fetch lead statuses.'
+        : 'Failed to fetch lead statuses.',
+    );
+  }
+
+  return payload;
+}
+
+async function fetchTicketPriorities() {
+  const response = await fetch('/api/ticket-priorities', {
+    method: 'GET',
+    headers: {
+      Accept: 'application/json',
+    },
+    cache: 'no-store',
+  });
+
+  const payload = (await response.json().catch(() => null)) as
+    | ApiTicketSetting[]
+    | { message?: string }
+    | null;
+
+  if (!response.ok || !Array.isArray(payload)) {
+    throw new Error(
+      !Array.isArray(payload)
+        ? payload?.message || 'Failed to fetch lead priorities.'
+        : 'Failed to fetch lead priorities.',
+    );
+  }
+
+  return payload;
+}
+
+type ApiTicketContactOption = {
+  id: string;
+  fullName: string | null;
+  phone: string;
+};
+
+async function fetchTicketContactOptions() {
+  const response = await fetch('/api/contacts?limit=200', {
+    method: 'GET',
+    headers: {
+      Accept: 'application/json',
+    },
+    cache: 'no-store',
+  });
+
+  const payload = (await response.json().catch(() => null)) as {
+    items?: ApiTicketContactOption[];
+    message?: string;
+  } | null;
+
+  if (!response.ok || !Array.isArray(payload?.items)) {
+    throw new Error(payload?.message || 'Failed to fetch contacts.');
+  }
+
+  return payload.items;
+}
+
+async function fetchSocketToken(): Promise<SocketTokenResponse> {
+  const response = await fetch('/api/auth/socket-token', {
+    method: 'GET',
+    headers: {
+      Accept: 'application/json',
+    },
+    cache: 'no-store',
+    credentials: 'include',
+  });
+
+  const payload = (await response.json().catch(() => null)) as
+    | SocketTokenResponse
+    | { message?: string }
+    | null;
+
+  if (!response.ok || !payload || !('accessToken' in payload)) {
+    throw new Error(
+      payload && 'message' in payload
+        ? payload.message || 'Failed to authorize socket connection.'
+        : 'Failed to authorize socket connection.',
+    );
+  }
+
+  return payload;
+}
+
+function isNotFoundError(error: unknown) {
+  if (typeof error !== 'object' || error === null) {
+    return false;
+  }
+
+  const status =
+    'status' in error ? (error as { status?: number }).status : undefined;
+  const message =
+    'message' in error ? (error as { message?: string }).message : undefined;
+
+  return (
+    status === 404 ||
+    message?.trim().toLowerCase() === 'project not found' ||
+    message?.trim().toLowerCase() === 'failed to fetch project.'
+  );
+}
+
+function getTicketStatusColor(status: string, statuses?: ApiTicketSetting[]) {
+  const normalizedStatus = normalizeStatusValue(status);
+
+  return statuses?.find((item) => {
+    return (
+      normalizeStatusValue(item.label) === normalizedStatus ||
+      normalizeStatusValue(item.key) === normalizedStatus
+    );
+  })?.color;
+}
+
+function getProjectTicketFilterValue(value: string | null) {
+  if (!value || !value.trim()) {
+    return 'all';
+  }
+
+  return value;
+}
+
+function getDashboardStatusFilterValue(value: string | null) {
+  if (!value || !value.trim()) {
+    return 'Active';
+  }
+
+  return value;
+}
+
+function normalizeStatusValue(value: string) {
+  return value.trim().toLowerCase().replace(/\s+/g, '');
+}
+
+function CloseCrossIcon() {
+  return (
+    <svg
+      width="20"
+      height="20"
+      viewBox="0 0 20 20"
+      fill="none"
+      xmlns="http://www.w3.org/2000/svg"
+      aria-hidden="true"
+    >
+      <path
+        d="M5 5L15 15M15 5L5 15"
+        stroke="currentColor"
+        strokeWidth="1.8"
+        strokeLinecap="round"
+      />
+    </svg>
+  );
+}
+
+// function ProjectDetailSkeleton({ onBack }: { onBack: () => void }) {
+//   return (
+//     <div
+//       className="relative z-100 h-dvh overflow-hidden py-5 pr-5"
+//       aria-hidden="true"
+//     >
+//       <div className="flex h-full min-h-0 min-w-0 flex-col gap-3 overflow-hidden rounded-3xl border border-white bg-white/40 p-3">
+//         <div className="flex min-h-0 min-w-0 flex-1 animate-pulse flex-col gap-4 overflow-hidden rounded-3xl bg-white p-4 shadow-[0_0_35px_0_rgb(0_0_0/0.04)] md:p-5">
+//           {/* Project summary */}
+//           <section className="w-full shrink-0">
+//             <div className="flex min-w-0 items-start gap-3 sm:items-center sm:gap-4">
+//               <div className="h-12 w-12 shrink-0 rounded-full bg-gray-200 sm:h-19 sm:w-19" />
+
+//               <div className="min-w-0 flex-1">
+//                 {/* Name and category */}
+//                 <div className="flex flex-wrap items-center gap-3">
+//                   <div className="h-5 w-40 rounded bg-gray-200" />
+//                   <div className="h-6 w-24 rounded-full bg-gray-100" />
+//                 </div>
+
+//                 {/* Summary metrics */}
+//                 <div className="mt-3 flex max-w-full flex-wrap items-center gap-x-5 gap-y-2">
+//                   {Array.from({ length: 3 }).map((_, index) => (
+//                     <div key={index} className="flex items-center gap-2">
+//                       <div className="h-2.5 w-2.5 shrink-0 rounded-full bg-gray-200" />
+//                       <div
+//                         className={`h-3.5 rounded bg-gray-200 ${
+//                           index === 1 ? 'w-20' : 'w-12'
+//                         }`}
+//                       />
+//                       <div className="h-4 w-6 rounded bg-gray-200" />
+//                     </div>
+//                   ))}
+//                 </div>
+//               </div>
+//             </div>
+//           </section>
+
+//           {/* Tabs */}
+//           <div className="flex shrink-0 overflow-hidden border-y border-gray-200">
+//             {Array.from({ length: 4 }).map((_, index) => (
+//               <div
+//                 key={index}
+//                 className={`border-b-2 px-4 py-3 ${
+//                   index === 0 ? 'border-gray-300' : 'border-transparent'
+//                 }`}
+//               >
+//                 <div
+//                   className={`h-4 rounded bg-gray-200 ${
+//                     index === 3 ? 'w-16' : 'w-12'
+//                   }`}
+//                 />
+//               </div>
+//             ))}
+//           </div>
+
+//           {/* Active tab content */}
+//           <div className="flex min-h-0 min-w-0 flex-1 flex-col gap-4 overflow-hidden">
+//             {/* Search/filter row */}
+//             <div className="flex shrink-0 flex-col gap-3 md:flex-row md:items-center md:justify-between">
+//               <div className="h-10 w-full rounded-lg border border-gray-200 bg-gray-100 md:max-w-xs" />
+
+//               <div className="flex items-center gap-3">
+//                 <div className="h-10 w-36 rounded-lg border border-gray-200 bg-gray-100" />
+//                 <div className="h-10 w-36 rounded-lg border border-gray-200 bg-gray-100" />
+//                 <div className="h-10 w-28 rounded-full bg-gray-200" />
+//               </div>
+//             </div>
+
+//             {/* Tickets table */}
+//             <div className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-xl border border-gray-200 bg-white">
+//               {/* Table header */}
+//               <div className="grid grid-cols-6 gap-4 border-b border-gray-200 bg-gray-50 px-4 py-4">
+//                 {Array.from({ length: 6 }).map((_, index) => (
+//                   <div key={index} className="h-4 rounded bg-gray-200" />
+//                 ))}
+//               </div>
+
+//               {/* Table rows */}
+//               <div className="min-h-0 flex-1 overflow-hidden">
+//                 {Array.from({ length: 6 }).map((_, rowIndex) => (
+//                   <div
+//                     key={rowIndex}
+//                     className="grid grid-cols-6 gap-4 border-b border-gray-200 px-4 py-4 last:border-b-0"
+//                   >
+//                     {Array.from({ length: 6 }).map((_, cellIndex) => (
+//                       <div
+//                         key={cellIndex}
+//                         className={`h-4 rounded ${
+//                           cellIndex === 3 || cellIndex === 4
+//                             ? 'bg-gray-200'
+//                             : 'bg-gray-100'
+//                         }`}
+//                       />
+//                     ))}
+//                   </div>
+//                 ))}
+//               </div>
+
+//               {/* Pagination */}
+//               <div className="flex items-center justify-between border-t border-gray-200 px-4 py-3">
+//                 <div className="h-8 w-32 rounded bg-gray-100" />
+//                 <div className="flex gap-2">
+//                   {Array.from({ length: 4 }).map((_, index) => (
+//                     <div
+//                       key={index}
+//                       className="h-8 w-8 rounded-md bg-gray-100"
+//                     />
+//                   ))}
+//                 </div>
+//               </div>
+//             </div>
+//           </div>
+//         </div>
+//       </div>
+//     </div>
+//   );
+// }
+function SkeletonBlock({ className }: { className: string }) {
+  return <div className={`animate-pulse rounded bg-gray-200 ${className}`} />;
+}
+
+type ProjectDetailSkeletonProps = {
+  activeTab: string | null;
+};
+
+function ProjectDetailSkeleton({ activeTab }: ProjectDetailSkeletonProps) {
+  return (
+    <div
+      className="
+        relative z-100 h-auto min-h-dvh overflow-visible
+        pb-4
+        xl:h-dvh xl:overflow-hidden xl:px-0 xl:py-5 xl:pr-5
+      "
+      aria-hidden="true"
+    >
+      <div
+        className="
+          flex h-auto min-h-0 min-w-0 flex-col gap-3 overflow-visible
+          xl:h-full xl:overflow-hidden xl:rounded-2xl
+          xl:border xl:border-white xl:bg-white/40 xl:p-3
+        "
+      >
+        <ProjectSummarySkeleton />
+
+        <div
+          className="
+            mx-4 flex h-auto min-h-0 min-w-0 flex-none flex-col gap-4
+            overflow-visible rounded-xl bg-white p-3
+            shadow-[0_0_35px_0_rgb(0_0_0/0.04)]
+            md:px-5 md:pt-4
+            xl:mx-0 xl:h-full xl:flex-1 xl:overflow-hidden
+          "
+        >
+          <ProjectTabsSkeleton />
+
+          <div className="min-h-0 flex-1">
+            <ProjectActiveTabSkeleton activeTab={activeTab} />
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+function ProjectActiveTabSkeleton({ activeTab }: { activeTab: string | null }) {
+  switch (activeTab) {
+    case '1':
+      return <ProjectThreadSkeleton />;
+
+    case '2':
+      return <ProjectFilesSkeleton />;
+
+    case '3':
+      return <ProjectCalendarSkeleton />;
+
+    case '4':
+      return <ProjectNotesSkeleton />;
+
+    default:
+      return (
+        <div className="flex min-h-0 flex-col gap-4 xl:h-full">
+          <ProjectTicketFiltersSkeleton />
+
+          <div className="min-h-0 xl:flex-1 xl:overflow-hidden">
+            <RecentTicketsTableSkeleton />
+          </div>
+        </div>
+      );
+  }
+}
+
+function ProjectNotesSkeleton() {
+  return (
+    <div
+      className="
+        grid h-auto min-h-0 animate-pulse
+        overflow-hidden rounded-sm border border-gray-200
+        xl:h-full xl:grid-cols-[340px_minmax(0,1fr)]
+        xl:rounded-2xl
+      "
+    >
+      <section className="flex min-h-96 flex-col border-e border-gray-200 bg-white">
+        <div className="border-b border-gray-200 bg-gray-50 px-3.5 py-3.5">
+          <div className="flex items-center justify-between gap-3">
+            <div className="flex items-center gap-2">
+              <SkeletonBlock className="h-5 w-14" />
+              <SkeletonBlock className="h-5 w-14 rounded-full" />
+            </div>
+
+            <SkeletonBlock className="h-9 w-20 rounded-lg" />
+          </div>
+
+          <SkeletonBlock className="mt-4 h-10 w-full rounded-lg" />
+        </div>
+
+        <ProjectNotesListSkeleton />
+      </section>
+
+      <section className="hidden min-h-96 bg-white p-5 xl:block">
+        <SkeletonBlock className="h-6 w-40" />
+
+        <div className="mt-5 space-y-3">
+          <SkeletonBlock className="h-4 w-full bg-gray-100" />
+          <SkeletonBlock className="h-4 w-5/6 bg-gray-100" />
+          <SkeletonBlock className="h-4 w-2/3 bg-gray-100" />
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function ProjectCalendarSkeleton() {
+  return (
+    <div
+      className="h-auto min-h-[500px] animate-pulse rounded-xl border border-gray-200 bg-white p-4 xl:h-full"
+      aria-hidden="true"
+    >
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <SkeletonBlock className="h-8 w-40" />
+
+        <div className="flex items-center gap-2">
+          <SkeletonBlock className="h-9 w-9 rounded-lg" />
+          <SkeletonBlock className="h-9 w-24 rounded-lg" />
+          <SkeletonBlock className="h-9 w-9 rounded-lg" />
+        </div>
+      </div>
+
+      <div className="mt-5 grid grid-cols-7 border-t border-l border-gray-200">
+        {Array.from({ length: 42 }).map((_, index) => (
+          <div
+            key={index}
+            className="min-h-20 border-r border-b border-gray-200 p-2 md:min-h-24"
+          >
+            <SkeletonBlock className="h-3 w-5 bg-gray-100" />
+
+            {index % 5 === 0 ? (
+              <SkeletonBlock className="mt-3 h-5 w-full rounded-md" />
+            ) : null}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function ProjectSummarySkeleton() {
+  return (
+    <div
+      className="
+        relative flex w-full shrink-0 animate-pulse
+        flex-col items-start gap-2 overflow-hidden
+        rounded-none px-4 py-4
+        xl:rounded-xl
+        xl:flex-row xl:items-start xl:gap-4
+        xl:px-7.5 xl:py-6
+      "
+      style={{
+        backgroundImage: `
+          url('/images/DashboardComponentBgImage.jpg'),
+          linear-gradient(
+            to right,
+            #335C94 0%,
+            #665932 25%,
+            #7B398E 50%,
+            #003F89 75%,
+            #070922 100%
+          )
+        `,
+        backgroundSize: 'cover',
+        backgroundPosition: 'center',
+      }}
+      aria-hidden="true"
+    >
+      {/* Same dark overlay as actual banner */}
+      <div className="absolute inset-0 bg-black/30" />
+
+      {/* Back button, mobile title and category */}
+      <div className="relative hidden min-w-0 items-center gap-3 xl:contents">
+        <div className="h-10 w-10 shrink-0 rounded-full bg-white/15 backdrop-blur-3xl xl:h-12 xl:w-12">
+          <div className="flex h-full w-full items-center justify-center">
+            <div className="h-3 w-3 rotate-45 border-b-2 border-l-2 border-white/60" />
+          </div>
+        </div>
+
+        <div className="h-6 w-40 rounded bg-white/25 xl:hidden" />
+
+        <div className="h-6 w-12 rounded-full bg-white/20 xl:hidden" />
+      </div>
+
+      <div
+        className="
+          relative flex min-w-0 w-full flex-1
+          flex-col gap-3
+          md:flex-row
+          xl:items-center xl:justify-between xl:gap-4
+        "
+      >
+        {/* Desktop project name and category */}
+        <div className="hidden min-w-0 items-center gap-4 xl:flex">
+          <div className="h-9 w-60 rounded bg-white/25" />
+          <div className="h-6 w-12 rounded-full bg-white/20" />
+        </div>
+
+        {/* Stats box */}
+        <div
+          className="
+            grid w-full grid-cols-2 gap-2
+            rounded-xl border border-white/12
+            bg-white/10 p-2
+            backdrop-blur-3xl
+            drop-shadow-[0_14px_44px_0_rgb(0_0_0/0.45)]
+            sm:w-fit
+            xl:flex xl:max-w-full xl:flex-row
+            xl:items-center xl:gap-5.5 xl:px-4
+          "
+        >
+          {Array.from({ length: 3 }).map((_, index) => (
+            <div key={index} className="contents">
+              {index > 0 ? (
+                <div
+                  className="
+                    hidden h-5.25 w-0.5 shrink-0
+                    bg-linear-to-b
+                    from-white/0 via-white/60 to-white/0
+                    xl:block
+                  "
+                />
+              ) : null}
+
+              <div
+                className="
+                  flex min-w-0 items-center
+                  justify-between gap-2
+                  xl:shrink-0 xl:justify-start xl:gap-4
+                "
+              >
+                <div className="flex min-w-0 items-center gap-2">
+                  <div className="relative flex h-4 w-4 shrink-0 items-center justify-center rounded-full border border-white/40">
+                    <div className="h-2.5 w-2.5 rounded-full bg-white/30" />
+                  </div>
+
+                  <div
+                    className={`h-4 rounded bg-white/25 ${
+                      index === 1 ? 'w-24' : 'w-14'
+                    }`}
+                  />
+                </div>
+
+                <div className="h-5 w-6 shrink-0 rounded bg-white/30" />
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ProjectTabsSkeleton() {
+  return (
+    <div
+      className="
+        flex shrink-0 animate-pulse
+        overflow-x-hidden border-b border-gray-200
+      "
+    >
+      {Array.from({ length: 5 }).map((_, index) => (
+        <div
+          key={index}
+          className={`
+            flex shrink-0 items-center gap-2
+            border-b-2 px-2 pt-3 pb-2
+            xl:px-4
+            ${index === 0 ? 'border-gray-300' : 'border-transparent'}
+          `}
+        >
+          <SkeletonBlock className="h-4 w-4 rounded-sm" />
+          <SkeletonBlock className={index === 3 ? 'h-4 w-16' : 'h-4 w-12'} />
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function ProjectTicketFiltersSkeleton() {
+  return (
+    <div
+      className="
+        flex shrink-0 animate-pulse
+        flex-col gap-3
+        md:flex-row md:items-center md:justify-between
+      "
+    >
+      <div className="flex items-center gap-3">
+        <SkeletonBlock className="h-10 w-full min-w-0 rounded-lg md:w-72" />
+        <SkeletonBlock className="h-10 w-10 shrink-0 rounded-lg xl:hidden" />
+      </div>
+
+      <div className="hidden items-center gap-3 xl:flex">
+        <SkeletonBlock className="h-10 w-20 rounded-lg" />
+        <SkeletonBlock className="h-10 w-55 rounded-lg" />
+        <SkeletonBlock className="h-10 w-28 rounded-lg" />
+        <SkeletonBlock className="h-10 w-32 rounded-full" />
+      </div>
+    </div>
+  );
+}
+
+function ProjectThreadSkeleton() {
+  return (
+    <div
+      className="
+        flex min-h-[calc(100dvh-260px)] flex-col
+        overflow-hidden rounded-xl border border-gray-200
+        bg-white animate-pulse
+        xl:h-full xl:min-h-0
+      "
+      aria-hidden="true"
+    >
+      <div className="flex h-14 shrink-0 items-center justify-between border-b border-gray-200 px-4">
+        <SkeletonBlock className="h-5 w-24" />
+        <SkeletonBlock className="h-8 w-8 rounded-full" />
+      </div>
+
+      <div className="flex min-h-0 flex-1 flex-col justify-end gap-5 overflow-hidden p-4">
+        {Array.from({ length: 4 }).map((_, index) => (
+          <div key={index} className="flex items-start gap-3">
+            <SkeletonBlock className="h-8 w-8 shrink-0 rounded-full" />
+
+            <div className={`min-w-0 ${index % 2 === 0 ? 'w-3/4' : 'w-1/2'}`}>
+              <div className="flex items-center gap-2">
+                <SkeletonBlock className="h-3.5 w-24" />
+                <SkeletonBlock className="h-3 w-20" />
+              </div>
+
+              <div className="mt-2 rounded-xl border border-gray-200 p-3">
+                <SkeletonBlock className="h-3.5 w-full" />
+                {index % 2 === 0 ? (
+                  <SkeletonBlock className="mt-2 h-3.5 w-2/3" />
+                ) : null}
+              </div>
+            </div>
+          </div>
+        ))}
+      </div>
+
+      <div className="shrink-0 border-t border-gray-200 p-4">
+        <SkeletonBlock className="h-20 w-full rounded-xl" />
+      </div>
+    </div>
+  );
+}
+
+function ProjectFilesSkeleton() {
+  return (
+    <div
+      className="flex h-auto min-h-0 flex-col space-y-4 animate-pulse xl:h-full"
+      aria-hidden="true"
+    >
+      {/* Search and upload button */}
+      <div className="flex flex-col gap-3 rounded-2xl md:flex-row md:items-center md:justify-between">
+        <div className="h-10.5 w-full rounded-lg border border-gray-200 bg-gray-100 md:max-w-xs" />
+
+        <div className="h-10 w-full rounded-lg bg-gray-200 md:w-32" />
+      </div>
+
+      {/* Files container */}
+      <div
+        className="
+          flex max-h-none min-h-0 flex-none flex-col
+          overflow-visible rounded-xl border border-gray-200 bg-white
+          sm:rounded-2xl
+          xl:max-h-[calc(100dvh-360px)] xl:flex-1 xl:overflow-hidden
+        "
+      >
+        {/* Files container header */}
+        <div className="flex shrink-0 items-center justify-between border-b border-gray-200 px-3 py-3 sm:px-4">
+          <SkeletonBlock className="h-4 w-24" />
+          <SkeletonBlock className="h-4 w-14" />
+        </div>
+
+        {/* File rows */}
+        <div className="min-h-0 flex-1 overflow-hidden">
+          {Array.from({ length: 5 }).map((_, index) => (
+            <ProjectFileRowSkeleton key={index} index={index} />
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ProjectFileRowSkeleton({ index }: { index: number }) {
+  return (
+    <div className="border-b border-gray-200 px-3 py-4 last:border-b-0 sm:px-4">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+        {/* File information */}
+        <div className="flex min-w-0 items-start gap-3 sm:items-center sm:gap-4">
+          {/* File icon */}
+          <SkeletonBlock className="h-10 w-10 shrink-0 rounded-sm" />
+
+          <div className="min-w-0 flex-1">
+            {/* File name */}
+            <SkeletonBlock
+              className={`h-4 ${
+                index % 2 === 0 ? 'w-48 max-w-full' : 'w-36 max-w-full'
+              }`}
+            />
+
+            {/* Size and uploaded date */}
+            <div className="mt-2 flex items-center gap-2">
+              <SkeletonBlock className="h-3 w-10 bg-gray-100" />
+
+              <div className="h-1 w-1 shrink-0 rounded-full bg-gray-200" />
+
+              <SkeletonBlock className="h-3 w-20 bg-gray-100" />
+            </div>
+
+            {/* Source pill */}
+            <div className="mt-2">
+              <SkeletonBlock className="h-6 w-24 rounded-full bg-gray-100" />
+            </div>
+          </div>
+        </div>
+
+        {/* File actions */}
+        <div className="flex items-center justify-end gap-2 sm:justify-start">
+          {Array.from({ length: 3 }).map((_, actionIndex) => (
+            <SkeletonBlock
+              key={actionIndex}
+              className="h-9 w-9 shrink-0 rounded-lg"
+            />
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ProjectNotesListSkeleton() {
+  return (
+    <div className="animate-pulse divide-y divide-gray-200" aria-hidden="true">
+      {Array.from({ length: 5 }).map((_, index) => (
+        <div key={index} className="px-3 py-3">
+          <div className="flex items-start justify-between gap-3">
+            <div className="min-w-0 flex-1">
+              <SkeletonBlock className="h-4 w-2/3" />
+              <SkeletonBlock className="mt-2 h-3.5 w-full bg-gray-100" />
+              <SkeletonBlock className="mt-2 h-3 w-28 bg-gray-100" />
+            </div>
+
+            <SkeletonBlock className="h-7 w-7 shrink-0 rounded-md" />
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+function getProjectTicketTypeFilterValue(value: string | null) {
+  if (value === 'bug' || value === 'feature_request') {
+    return value;
+  }
+
+  return 'all';
+}

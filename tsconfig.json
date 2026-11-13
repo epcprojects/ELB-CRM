@@ -1,0 +1,16 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compileOnSave": false,
+  "files": [],
+  "references": [
+    {
+      "path": "./apps/epc-crm-e2e"
+    },
+    {
+      "path": "./apps/epc-crm"
+    },
+    {
+      "path": "./apps/frontend"
+    }
+  ]
+}

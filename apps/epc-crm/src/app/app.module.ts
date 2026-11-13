@@ -1,0 +1,61 @@
+import { Module } from '@nestjs/common';
+import { AppController } from './app.controller';
+import { AppService } from './app.service';
+import { ConfigModule, ConfigService } from '@nestjs/config';
+import { TypeOrmModule } from '@nestjs/typeorm';
+import { environment } from '../../environments/environment';
+import { AuthModule } from './modules/auth/auth.module';
+import { UsersModule } from './modules/users/users.module';
+import { RolesModule } from './modules/roles/roles.module';
+import { TicketsModule } from './modules/tickets/tickets.module';
+import { ProjectsModule } from './modules/projects/projects.module';
+import { ProjectNotesModule } from './modules/project-notes/project-notes.module';
+import { ContactsModule } from './modules/contacts/contacts.module';
+import { TerritoriesModule } from './modules/territories/territories.module';
+import { NotificationsModule } from './modules/notifications/notifications.module';
+import { UtilityModule } from './modules/utility/utility.module';
+import { FilesModule } from './modules/files/files.module';
+import { CalendarModule } from './modules/calendar/calendar.module';
+import { ChatModule } from './modules/chat/chat.module';
+import { ActivityModule } from './modules/activity/activity-log.module';
+import { DashboardAnalyticsModule } from './modules/dashboard-analytics/dashboard-analytics.module';
+
+@Module({
+  imports: [
+    ConfigModule.forRoot({
+      isGlobal: true,
+      cache: true,
+      ignoreEnvFile: true,
+      load: [environment],
+    }),
+    TypeOrmModule.forRootAsync({
+      imports: [ConfigModule],
+      inject: [ConfigService],
+      useFactory: (configService: ConfigService) => {
+        const postgresConfig = configService.get('postgres');
+        return {
+          autoLoadEntities: true,
+          ...postgresConfig,
+        };
+      },
+    }),
+    AuthModule,
+    UsersModule,
+    RolesModule,
+    NotificationsModule,
+    ProjectsModule,
+    ProjectNotesModule,
+    ContactsModule,
+    TerritoriesModule,
+    TicketsModule,
+    UtilityModule,
+    FilesModule,
+    CalendarModule,
+    ChatModule,
+    ActivityModule,
+    DashboardAnalyticsModule,
+  ],
+  controllers: [AppController],
+  providers: [AppService],
+})
+export class AppModule {}
